@@ -64,6 +64,7 @@ DIRS := diagnostics				\
 	particles				\
 	particles/pushers			\
 	particles/examples			\
+	particles/util				\
 	particles/diagnostics			\
 	particles/tests				\
 	particles/initialisers      \
