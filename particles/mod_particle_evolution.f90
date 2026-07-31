@@ -249,7 +249,6 @@ contains
       call ccoll_init('ccolldata', dat)
       ccoll_re => ccoll_kinetic_relativistic_push_partialscreening
     else 
-      call ccoll_init('ccolldata', dat)
       ccoll_re => ccoll_none
     end if 
 
