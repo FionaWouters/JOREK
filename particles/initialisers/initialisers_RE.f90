@@ -57,12 +57,27 @@ pure function current_pdf(var) result(p)
   real*8              :: jzmin, jzmax 
 
   !> temporarily hard coded, but should be able to be obtained from fluid restart file
-  jzmax = 3.0 / 10.0 !1.173 / 10
-  jzmin = 0.0001239 / 11.0 !0.0003166 / 11
+  jzmax = 1.173 / 10
+  jzmin = 0.0003166 / 11
 
-  p = (var(2)/var(1)-jzmin)/(jzmax-jzmin)
+  p = (abs(var(2))/var(1)-jzmin)/(jzmax-jzmin)
 
 end function current_pdf
+
+! Quick and rough function to sample markers proportionally to n_RE from fluid simulation
+pure function density_pdf(var) result(p)
+  real*8, intent(in)  :: var(2) ! var(2)=n_RE, var(1) = R
+  !real*8, intent(in)  :: var(1) ! var(1)=j
+  real*8              :: p
+  real*8              :: nre_min, nre_max 
+
+  !> temporarily hard coded, but should be able to be obtained from fluid restart file
+  nre_max = 6.815d16 / 1.953d0 !1.173 / 10
+  nre_min = -3.518d13 / 1.715d0 !0.0003166 / 11
+
+  p = (var(2)/var(1)-nre_min)/(nre_max-nre_min)
+
+end function density_pdf
     
 subroutine basic_initialization(sim, group_num, rng, init_pdf, energy, pitch, std_energy)
   use phys_module, only: tstep_particles
@@ -87,7 +102,9 @@ subroutine basic_initialization(sim, group_num, rng, init_pdf, energy, pitch, st
     case ("RZ")
       call initialise_particles(sim%groups(group_num)%particles, sim%fields%node_list, sim%fields%element_list, rng, variables=[-2,-1], transform=RZ_pdf)
     case ("current")
-      call initialise_particles(sim%groups(group_num)%particles, sim%fields%node_list, sim%fields%element_list, rng, variables=[-1,var_zj], transform=current_pdf) 
+      call initialise_particles(sim%groups(group_num)%particles, sim%fields%node_list, sim%fields%element_list, rng, variables=[-1,var_zj], transform=current_pdf)
+    case ("density")
+      call initialise_particles(sim%groups(group_num)%particles, sim%fields%node_list, sim%fields%element_list, rng, variables=[-1,8], transform=density_pdf)  
     case ("analytical")
       call initialise_particles(sim%groups(group_num)%particles, sim%fields%node_list, sim%fields%element_list, rng, variables=[-2,-1], transform=analytical_pdf)
     case default
