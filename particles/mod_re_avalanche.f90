@@ -334,10 +334,10 @@ contains
     n_elements = sim%fields%element_list%n_elements
 
     ! One rng per rank (scalars; every rank used to allocate and initialize all streams)
-    call rng%initialize (n_dims=4, seed=2, n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng1%initialize(n_dims=1, seed=3, n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng2%initialize(n_dims=2, seed=4, n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng_shared%initialize(n_dims=1, seed=5, n_streams=1, i_stream=1, ierr=ifail)
+    call rng%initialize (n_dims=4, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    call rng1%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    call rng2%initialize(n_dims=2, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    call rng_shared%initialize(n_dims=1, seed=1, n_streams=1, i_stream=1, ierr=ifail)
 
     allocate(p_para_min(Ntor,n_elements,element_part_s,element_part_t))
     allocate(p_para_max(Ntor,n_elements,element_part_s,element_part_t))
@@ -619,11 +619,25 @@ contains
               ! Decode l = kjj + (kii-1)*Nbin into the p_para bin kii and the mu bin kjj, and
               ! draw p_para and mu uniformly within that bin
               ! (replaces the modulo() special-casing of the old version; identical values)
+
               call rng2%next(ran_p_mu)
-              kii = (l-1)/Nbin + 1
-              kjj = mod(l-1, Nbin) + 1
-              p_para = (real(kii,8) - ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
-              mu     = (real(kjj,8) - ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
+                  p_para = (1/real(Nbin,8)*(real(l,8)-real(modulo(l,Nbin),8))+1.d0 -ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+                  if (modulo(l,Nbin) .eq. 0) p_para = (real(l,8)/real(Nbin,8)-ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+
+                  mu = (real(modulo(l,Nbin), 8) -ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
+                  if (modulo(l,Nbin) .eq. 0) mu = (real(Nbin,8) -ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
+
+            !!  call rng2%next(ran_p_mu)
+            !!  !kii = (l-1)/Nbin + 1
+            !!  kii = int((real(l,8) - real(modulo(l,Nbin),8))/real(Nbin,8) + 1,4)
+            !!  kjj = modulo(l-1, Nbin) + 1
+            !!  !kjj = modulo(l,Nbin)
+            !!  if (modulo(l,Nbin) .eq. 0.d0) then
+            !!    kii = int(real(l,8)/real(Nbin,8),4)
+            !!    kjj = Nbin
+            !!  end if 
+            !!  p_para = (real(kii,8) - ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+            !!  mu     = (real(kjj,8) - ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
 
               if (mu .le. 0.d0) write(*,*) 'mu is zero or negative', mu, 'mu_max', mu_max(j,i,h,g), 'mu_min', mu_min(j,i,h,g), 'p_para', p_para
 
