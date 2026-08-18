@@ -432,7 +432,7 @@ mpi_comm_in,mpi_info_in,test_in)
   integer                                        :: n_groups_old, n_dropped_groups
   integer(HID_T)                                 :: file_id,group_id
   integer(HSIZE_T)                               :: offset,n_particles_hsizet
-  integer,          dimension(:),    allocatable :: n_particles_per_mpi_array
+  integer,          dimension(:),    allocatable :: n_particles_per_mpi_array, live_n_particles_per_mpi_array
   integer*4,        dimension(:),    allocatable :: i_elm_arr,i_life_arr
   integer*4,        dimension(:),    allocatable :: q_arr
   integer(HSIZE_T), dimension(:),    allocatable :: n_particles_tot,n_particles_max
@@ -609,6 +609,9 @@ mpi_comm_in,mpi_info_in,test_in)
         
         if(.not. sim%hard_coded_init) then
           ! overriding n_particles_tot from import with n_particles from config
+          if (config%n_particles .gt. n_particles_tot(1)) then 
+            live_n_particles_per_mpi_array = calc_n_particles_per_mpi_array(int(n_particles_tot(1)), sim%n_mpi)
+          end if 
           sim%groups(i)%n_particles = config%n_particles
           n_particles_tot(1) = config%n_particles
         
@@ -639,8 +642,14 @@ mpi_comm_in,mpi_info_in,test_in)
           write(*,*) " ----------------------------------------------- "
         endif
 
-        offset = int(sum(n_particles_per_mpi_array(1:sim%my_id)),kind=HSIZE_T)
-        n_particles_hsizet = int(n_particles_per_mpi_array(sim%my_id+1),kind=HSIZE_T)
+        if (config%n_particles .gt. n_particles_tot(1)) then 
+          offset = int(sum(live_n_particles_per_mpi_array(1:sim%my_id)),kind=HSIZE_T)
+          n_particles_hsizet = int(live_n_particles_per_mpi_array(sim%my_id+1),kind=HSIZE_T)
+        else 
+          offset = int(sum(n_particles_per_mpi_array(1:sim%my_id)),kind=HSIZE_T)
+          n_particles_hsizet = int(n_particles_per_mpi_array(sim%my_id+1),kind=HSIZE_T)
+          live_n_particles_per_mpi_array = n_particles_per_mpi_array
+        end if 
 
         !> allocate particle list and initialise to 0 -----------------
         if (allocated(sim%groups(i)%particles)) deallocate(sim%groups(i)%particles)
@@ -701,7 +710,7 @@ mpi_comm_in,mpi_info_in,test_in)
         call HDF5_allocatable_array3D_reading(file_id,dAstar_k_arr,trim(group_name)//"dAstar_k",&
         reqdims_in=[n1_HSIZE_T,n1_HSIZE_T,n_particles_hsizet],start=[i0_HSIZE_T,i0_HSIZE_T,offset])
         !> fill particle list from arrays
-        call particle_list_from_arrays(n_particles_per_mpi_array(sim%my_id+1),sim%groups(i)%particles,ierr,&
+        call particle_list_from_arrays(live_n_particles_per_mpi_arrayn_particles_per_mpi_array(sim%my_id+1),sim%groups(i)%particles,ierr,&
         i_elm_arr=i_elm_arr,i_life_arr=i_life_arr,t_birth_arr=t_birth_arr,weight_arr=weight_arr,&
         x_arr=x_arr,st_arr=st_arr,q_arr=q_arr,v_1d_arr=v_1d_arr,E_arr=E_arr,mu_arr=mu_arr,&
         vpar_arr=vpar_arr,B_norm_arr=B_norm_arr,vpar_m_arr=vpar_m_arr,B_hat_prev_arr=B_hat_prev_arr,&
