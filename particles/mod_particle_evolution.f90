@@ -60,7 +60,7 @@ contains
   !> - performs coupling scheme specific physics (e.g. ionisation, radiation... etc)
   !> - creates the feedback rhs required for projections of kinetic variables
   !> - evolves the location and velocity of the particles based on the background plasma (pushing)
-  subroutine evolve_particle_group(sim, group_num, jorek_feedback, rng, tstep_part_adj, nstep_part_adj)
+  subroutine evolve_particle_group(sim, group_num, jorek_feedback, rng, tstep_part_adj, nstep_part_adj, nstep_inner_loop)
     use mod_project_particles
     use mod_random_seed
     use mod_interp, only: mode_moivre
@@ -76,6 +76,7 @@ contains
     type(pcg32_rng), dimension(:), allocatable, intent(inout) :: rng
     real*8,  intent(in)                                       :: tstep_part_adj
     integer, intent(in)                                       :: nstep_part_adj
+    integer, intent(in)                                       :: nstep_inner_loop
     
     real*8,allocatable :: feedback_rhs(:,:,:,:,:)
     type (type_node_list),         pointer :: feedback_nodelist
@@ -151,10 +152,12 @@ contains
 
     !> rep specific projections
     if (part_group%coupling_scheme == 'rep') then
-      feedback_rhs = feedback_rhs / real(nstep_part_adj,8) 
+      feedback_rhs = feedback_rhs / real(nstep_inner_loop,8) 
       jorek_feedback%rhs(:,:,:,:,P_par_idx_kin)   = jorek_feedback%rhs(:,:,:,:,P_par_idx_kin)   + feedback_rhs(:,:,:,:,P_par_idx_kin)
       jorek_feedback%rhs(:,:,:,:,P_perp_idx_kin)  = jorek_feedback%rhs(:,:,:,:,P_perp_idx_kin)  + feedback_rhs(:,:,:,:,P_perp_idx_kin)
       jorek_feedback%rhs(:,:,:,:,j_Phi_idx_kin)   = jorek_feedback%rhs(:,:,:,:,j_Phi_idx_kin)   + feedback_rhs(:,:,:,:,j_Phi_idx_kin)
+
+      jorek_feedback%rhs(:,:,:,:,4)   = jorek_feedback%rhs(:,:,:,:,4)   + feedback_rhs(:,:,:,:,4)
     endif
 
     !> epf specific projection
@@ -310,6 +313,8 @@ contains
                 feedback_rhs(n,m,particles(j)%i_elm,i_tor,P_par_idx_kin)  = feedback_rhs(n,m,particles(j)%i_elm,i_tor,P_par_idx_kin)  + HZ(i_tor)*v_Ppar
                 feedback_rhs(n,m,particles(j)%i_elm,i_tor,P_perp_idx_kin) = feedback_rhs(n,m,particles(j)%i_elm,i_tor,P_perp_idx_kin) + HZ(i_tor)*v_Pperp
                 feedback_rhs(n,m,particles(j)%i_elm,i_tor,j_Phi_idx_kin)  = feedback_rhs(n,m,particles(j)%i_elm,i_tor,j_Phi_idx_kin)  + HZ(i_tor)*v_jPhi
+
+                feedback_rhs(n,m,particles(j)%i_elm,i_tor,4)  = feedback_rhs(n,m,particles(j)%i_elm,i_tor,4)  + HZ(i_tor)*proj_factor
 
                 !> inverse implementation from Hannes (TODO: reverse data structure of the projections generally)
                 ! feedback_rhs_inv(P_par_idx_kin,i_tor,particles(j)%i_elm,m,n) = feedback_rhs_inv(P_par_idx_kin,i_tor,particles(j)%i_elm,m,n) + HZ(i_tor)*v_Ppar

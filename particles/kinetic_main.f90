@@ -371,17 +371,17 @@ do while (.not. sim%stop_now)
     !>  - kinetic neutrals
     !>  - kinetic impurities
 
+    ! evolution loop is called every inner particle step, for inner_stepsize number of steps at once
+    do group_num=1, n_part_groups
+      call evolve_particle_group(sim, group_num, jorek_feedback, rng, sim%tstep_part_adj, inner_stepsize, sim%nstep_inner_loop)
+    enddo 
+    
     ! RE avalanche
     if ((size(re_avalanche) .gt. 0) .and. ((mod(istep_inner_loop, gcd_re_avalanche) .eq. 0.d0) .or. last_step)) then
       do i=1,size(re_avalanche)
         call re_avalanche(i)%do(sim)
       end do 
     end if 
-
-    ! evolution loop is called every inner particle step, for inner_stepsize number of steps at once
-    do group_num=1, n_part_groups
-      call evolve_particle_group(sim, group_num, jorek_feedback, rng, sim%tstep_part_adj, inner_stepsize)
-    enddo  
 
     ! --- Handling the particles that left the domain
 
