@@ -37,11 +37,13 @@ module mod_re_avalanche
     use mod_random_seed
     use mod_ccoll_relativistic
     use mod_pusher_tools
+    use mpi
+    !$ use omp_lib
     implicit none
     private
 
     public :: reorder_indices, Moller_scatt, do_binning_mpi, type_re_avalanche, &
-              re_avalanche_from_config, gcd_re_avalanche
+              re_avalanche_from_config, gcd_re_avalanche, initialize
 
     type :: type_re_avalanche
       integer :: group_num
@@ -134,7 +136,7 @@ contains
     integer*4, intent(inout) :: n_part      !< amount of active markers, updated here (+2 per collision)
     integer*4, intent(inout) :: emptyind(:) !< active marker indices first, then inactive (cf. reorder_indices)
 
-    type(pcg32_rng) :: rng1, rng2, rng3               ! rngs used for the collisions
+    type(pcg32_rng), allocatable :: rng1(:), rng2(:), rng3(:)   ! rngs used for the collisions
 
     real*8 :: gamma_0                                 ! Lorentz factor incoming RE
     real*8 :: gamma, gamma_prime                      ! Lorentz factors (energies) of the collision products
@@ -151,6 +153,8 @@ contains
     real*8 :: DUMMY_REAL
     integer*4 :: j, i_child, n_part_old
     integer*4 :: process_rank, amount_processes, ierror, ifail
+    integer*4 :: seed1, seed2, seed3
+    integer*4 :: n_threads, n_streams, seq, i_thread, i_rng
 
     call reorder_indices(sim, group_num, emptyind)
     n_part_old = n_part
@@ -159,9 +163,34 @@ contains
     call MPI_COMM_SIZE(MPI_COMM_WORLD, amount_processes, ierror)
 
     ! Initialize the needed rngs (scalars now; they were size-1 allocatable arrays)
-    call rng1%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng2%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng3%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    !call rng1%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    !call rng2%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+    !call rng3%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
+
+    ! Calculate 1 seed and communicate over MPI
+    if (sim%my_id .eq. 0) seed1 = random_seed()
+    if (sim%my_id .eq. 0) seed2 = random_seed()
+    if (sim%my_id .eq. 0) seed3 = random_seed()
+    call MPI_Bcast(seed1, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierror)
+    call MPI_Bcast(seed2, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierror)
+    call MPI_Bcast(seed3, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierror)
+    ! Set up actual rng
+    n_threads = 1
+    !$ n_threads = omp_get_max_threads()
+    allocate(rng1(0:n_threads-1))
+    allocate(rng2(0:n_threads-1))
+    allocate(rng3(0:n_threads-1))
+    n_streams = sim%n_mpi*n_threads
+    do i_thread = 0, n_threads-1 
+      seq = sim%my_id*n_threads + i_thread + 1
+      call rng1(i_thread)%initialize(1, seed1, n_streams, seq, ierror)
+      call rng2(i_thread)%initialize(1, seed2, n_streams, seq, ierror)
+      call rng3(i_thread)%initialize(1, seed3, n_streams, seq, ierror)
+      if(ierror .ne. 0) then 
+        call MPI_ABORT(MPI_COMM_WORLD, -1, ierror)
+        write(*,*) "WARNING: Set-up rng's in large-angle (knock-on) collisions failed."
+      end if 
+    end do 
 
     ! Loop invariants (were recomputed for every particle; re now uses the MASS_ELECTRON
     ! constant instead of the hard-coded 9.109d-31)
@@ -171,7 +200,20 @@ contains
     select type (parts => sim%groups(group_num)%particles)
     type is (particle_kinetic_relativistic)
 
+    !$omp parallel default(none) &
+    !$omp shared(n_part_old, DUMMY_REAL, emptyind, sim, re, mass, dt_coll, gamma_min) &
+    !$omp shared(rng1, rng2, rng3) &
+    !$omp private(gamma_0, gamma, gamma_prime, theta, phi, sigma, prob, p2) &
+    !$omp private(v0, S_max, rand, rand_rng1, rand_rng2, rand_rng3, pnorm, vector) &
+    !$omp private(n1, n2, ne, i_child) &
+    !$omp private(j, i_rng) &
+    !$omp reduction(+:n_part) 
+
+    i_rng = 1
+    !$ i_rng = omp_get_thread_num()
+
     ! Loop over all particles
+    !$omp do schedule(dynamic,64)
     do j=1,n_part_old
 
       associate(pini => parts(emptyind(j)))
@@ -194,7 +236,9 @@ contains
       prob = sigma*ne*v0*dt_coll/2.d0 ! Probability of the RE having collided during dt_coll
 
       if ((prob .lt. 0.d0) .or. (prob .gt. 1.d0)) then
+        !$omp critical
         write(*,*) 'WARNING: timestep dt_coll chosen too large, current dt_coll:', dt_coll, 'Leads to collisional probability:', prob, 'Decrease dt_coll to at most', 1/(2*prob/dt_coll)
+        !$omp end critical
       end if
 
       ! Select the outgoing energy gamma of one of the electrons by rejection sampling of the
@@ -204,8 +248,8 @@ contains
       ! function moller_S (identical acceptance decisions, envelope S_max = moller_S(gamma_min)).
       S_max = moller_S(gamma_min, gamma_0)
       do
-        call rng1%next(rand_rng1)
-        call rng2%next(rand_rng2)
+        call rng1(i_rng)%next(rand_rng1)
+        call rng2(i_rng)%next(rand_rng2)
         gamma = rand_rng2(1)*(1.d0 + gamma_0 - 2.d0*gamma_min) + gamma_min
         if (rand_rng1(1)*S_max .le. moller_S(gamma, gamma_0)) exit
       end do
@@ -216,7 +260,7 @@ contains
       phi = asin(sqrt((gamma**2.d0-1.d0)/(gamma_prime**2.d0-1.d0))*sin(theta))
 
       ! The 2D collision plane: direction of the incoming momentum and a random orthonormal vector
-      call rng3%next(rand_rng3)
+      call rng3(i_rng)%next(rand_rng3)
       rand = rand_rng3(1)
       call get_orthonormals(pini%p, n1, n2)
       vector = cos(rand*2.d0*Pi)*n1 + sin(rand*2.d0*Pi)*n2 ! A vector orthonormal to p
@@ -243,6 +287,8 @@ contains
       end associate
 
     end do
+    !$omp end do 
+    !$omp end parallel
 
     class default
       if (sim%my_id .eq. 0) write(*,*) 'ERROR: Moller_scatt requires particles of type particle_kinetic_relativistic. Aborting.'
@@ -281,7 +327,8 @@ contains
     use constants, only: pi
     use mod_pcg32_rng
     use mod_interp, only: interp_RZ
-    use mpi_f08
+    !use mpi_f08
+    use mod_particle_sorting, only: sort_particles_in_elm, indices_in_elm 
 
     type(particle_sim)       :: sim
     integer,   intent(in)    :: group_num       !< particle group of the runaway electrons
@@ -305,8 +352,8 @@ contains
     type(pcg32_rng) :: rng, rng1, rng2, rng_shared
 
     real*8, allocatable :: p_para_min(:,:,:,:), p_para_max(:,:,:,:), mu_min(:,:,:,:), mu_max(:,:,:,:)
-    real*8, allocatable :: p_para_mu_array(:)          !< scratch histogram of one volume bin
-    real*8, allocatable :: p_para_mu_array2(:,:,:,:,:) !< histograms of all volume bins; bin index first now, unused last dimension (was 3) removed
+    real*8, allocatable :: dp_para(:,:,:,:), dmu(:,:,:,:)
+    real*8, allocatable :: p_para_mu_array(:,:,:,:,:) !< histograms of all volume bins; bin index first now, unused last dimension (was 3) removed
     real*8, allocatable :: weighttot2(:,:,:,:)         !< total marker weight per volume bin
     real*8, allocatable :: cum_prob(:)
     integer*4, allocatable :: particles_in_volume(:,:,:,:), amount_markers_spatial_bin(:,:,:), next_empty(:,:,:)
@@ -327,8 +374,21 @@ contains
     integer*4 :: new_markers_per_element_loop
     integer*4 :: process_rank, amount_processes, ifail
 
-    call MPI_COMM_RANK(MPI_COMM_WORLD, process_rank)
-    call MPI_COMM_SIZE(MPI_COMM_WORLD, amount_processes)
+    integer*4, allocatable :: vol_bin_start(:,:,:)   ! (Ntor, n_elements, element_part_s*element_part_t + 1)
+    integer*4, allocatable :: vol_bin_idx(:)          ! flat list of p_gc_array indices, grouped by bin
+
+    ! Intermediate: per-bin counts (reuse amount_markers_spatial_bin, already allocated)
+    ! sorted_by_elm and pa_in_elm from the sorting routine
+    type(indices_in_elm), allocatable :: sorted_by_elm(:)
+    integer,              allocatable :: pa_in_elm(:)
+    class(particle_base), allocatable, dimension(:) :: pa_polymorphic
+
+    integer*4 :: n_lin, ierr
+    integer*4, allocatable :: local_next(:,:)
+    integer*4 :: offset
+
+    call MPI_COMM_RANK(MPI_COMM_WORLD, process_rank, ierr)
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, amount_processes, ierr)
     if (sim%my_id .eq. 0) write(*,*) 'Amount processes (compare with jobpart settings)', amount_processes
 
     n_elements = sim%fields%element_list%n_elements
@@ -337,23 +397,25 @@ contains
     call rng%initialize (n_dims=4, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
     call rng1%initialize(n_dims=1, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
     call rng2%initialize(n_dims=2, seed=random_seed(), n_streams=amount_processes, i_stream=process_rank+1, ierr=ifail)
-    call rng_shared%initialize(n_dims=1, seed=1, n_streams=1, i_stream=1, ierr=ifail)
+    call rng_shared%initialize(n_dims=1, seed=5, n_streams=1, i_stream=1, ierr=ifail)
 
     allocate(p_para_min(Ntor,n_elements,element_part_s,element_part_t))
     allocate(p_para_max(Ntor,n_elements,element_part_s,element_part_t))
     allocate(mu_min(Ntor,n_elements,element_part_s,element_part_t))
     allocate(mu_max(Ntor,n_elements,element_part_s,element_part_t))
+    allocate(dp_para(Ntor,n_elements,element_part_s,element_part_t))
+    allocate(dmu(Ntor,n_elements,element_part_s,element_part_t))
 
     p_para_min(:,:,:,:) =  1.d30
     p_para_max(:,:,:,:) = -1.d30
     mu_min(:,:,:,:)     =  1.d30
     mu_max(:,:,:,:)     = -1.d30
 
-    allocate(p_para_mu_array(Nbin**2), cum_prob(Nbin**2))
-    allocate(p_para_mu_array2(Nbin**2, Ntor, n_elements, element_part_s, element_part_t))
+    allocate(cum_prob(Nbin**2))
+    allocate(p_para_mu_array(Nbin**2, Ntor, n_elements, element_part_s, element_part_t))
     allocate(weighttot2(Ntor, n_elements, element_part_s, element_part_t))
 
-    p_para_mu_array2(:,:,:,:,:) = 0.d0
+    p_para_mu_array(:,:,:,:,:) = 0.d0
     weighttot2(:,:,:,:) = 0.d0
 
     allocate(amount_markers_spatial_bin(Ntor, n_elements, element_part_s*element_part_t))
@@ -363,9 +425,6 @@ contains
 
     allocate(p_gc_array(n_part))
 
-    select type (parts => sim%groups(group_num)%particles)
-    type is (particle_kinetic_relativistic)
-
     ! --------------------------------------------------------------------------------
     ! Phase 1: convert all markers to GC, bin them spatially and record momentum bounds
     ! --------------------------------------------------------------------------------
@@ -374,18 +433,20 @@ contains
     weighttot = 0.d0
     pk = 1
     do k = 1,n_part
-        weighttot = weighttot + parts(emptyind(k))%weight
+      select type (p => sim%groups(group_num)%particles(emptyind(k)))
+      type is (particle_kinetic_relativistic)
+        weighttot = weighttot + p%weight
 
         ! iterative FO->GC conversion: B is needed at the GC position, which is only
         ! known after converting, so iterate starting from the FO position
-        gc_i_elm = parts(emptyind(k))%i_elm
-        gc_st    = parts(emptyind(k))%st
-        gc_phi   = parts(emptyind(k))%x(3)
+        gc_i_elm = p%i_elm
+        gc_st    = p%st
+        gc_phi   = p%x(3)
         do i=1,iterations
             if (gc_i_elm .le. 0) exit
             call sim%fields%calc_EBpsiU(sim%time, gc_i_elm, gc_st, gc_phi, E, B, psi, U)
             p_gc = relativistic_kinetic_to_relativistic_gc(sim%fields%node_list, sim%fields%element_list, &
-                                                           parts(emptyind(k)), sim%groups(group_num)%mass, B)
+                                                           p, sim%groups(group_num)%mass, B)
             gc_i_elm = p_gc%i_elm
             gc_st    = p_gc%st
             gc_phi   = p_gc%x(3)
@@ -408,6 +469,27 @@ contains
         if (p_gc_array(pk)%p(2) .le. 0.d0) write(*,*) 'Marker with negative mu', p_gc_array(pk)%p(2)
 
         pk = pk + 1
+
+      type is (particle_gc_relativistic)
+        weighttot = weighttot + p%weight
+
+        p_gc_array(pk) = p
+        if (p_gc_array(pk)%x(3) .lt. 0.d0) p_gc_array(pk)%x(3) = p_gc_array(pk)%x(3) + 2.d0*Pi
+
+        call get_spatial_bin(p_gc_array(pk), j, h, g, lin)
+        i = p_gc_array(pk)%i_elm
+
+        amount_markers_spatial_bin(j,i,lin) = amount_markers_spatial_bin(j,i,lin) + 1
+        p_para_max(j,i,h,g) = max(p_para_max(j,i,h,g), p_gc_array(pk)%p(1))
+        p_para_min(j,i,h,g) = min(p_para_min(j,i,h,g), p_gc_array(pk)%p(1))
+        mu_max(j,i,h,g)     = max(mu_max(j,i,h,g),     p_gc_array(pk)%p(2))
+        mu_min(j,i,h,g)     = min(mu_min(j,i,h,g),     p_gc_array(pk)%p(2))
+
+        if (p_gc_array(pk)%p(2) .le. 0.d0) write(*,*) 'Marker with negative mu', p_gc_array(pk)%p(2)
+
+        pk = pk + 1
+
+      end select 
     end do
     n_part = pk - 1 ! amount of successfully converted markers (was count(p_gc_array%i_elm>0))
     if (sim%my_id .eq. 0) write(*,*) 'weighttot p_gc_array', weighttot
@@ -415,20 +497,21 @@ contains
     ! --------------------------------------------------------------------------------
     ! Phase 2: global reduction of the bin counts and momentum bounds
     ! --------------------------------------------------------------------------------
-    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_max, size(p_para_max), MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_min, size(p_para_min), MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, mu_max, size(mu_max), MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, mu_min, size(mu_min), MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD)
-
-    call MPI_ALLREDUCE(MPI_IN_PLACE, amount_markers_spatial_bin, size(amount_markers_spatial_bin), MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_max, size(p_para_max), MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_min, size(p_para_min), MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD, ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, mu_max, size(mu_max), MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, mu_min, size(mu_min), MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD, ierr)
 
     ! Widen the bounds such that the centers of the outermost bins are at the min/max values.
-    ! NOTE: kept exactly as in the previous version, including that p_para_min/mu_min are
-    ! widened using the already-widened p_para_max/mu_max of the line above.
-    p_para_max = p_para_max + 0.5d0*(p_para_max-p_para_min)/real(Nbin-1,8)
-    p_para_min = p_para_min - 0.5d0*(p_para_max-p_para_min)/real(Nbin-1,8)
-    mu_max = mu_max + 0.5d0*(mu_max-mu_min)/real(Nbin-1,8)
-    mu_min = mu_min - 0.5d0*(mu_max-mu_min)/real(Nbin-1,8)
+    dp_para = (p_para_max-p_para_min)/real(Nbin-1,8)
+    dmu = (mu_max-mu_min)/real(Nbin-1,8)
+    p_para_max = p_para_max + 0.5d0*dp_para
+    p_para_min = p_para_min - 0.5d0*dp_para
+    mu_max = mu_max + 0.5d0*dmu
+    mu_min = mu_min - 0.5d0*dmu
+
+    deallocate(dp_para)
+    deallocate(dmu)
 
     end_time = MPI_WTIME()
     tot_time = mpi_minmeanmax(end_time-start_time)
@@ -441,19 +524,71 @@ contains
     ! --------------------------------------------------------------------------------
     start_time = MPI_WTIME()
 
-    max_markers_bin = maxval(amount_markers_spatial_bin(:,:,:))
-    allocate(particles_in_volume(Ntor, n_elements, element_part_s*element_part_t, max_markers_bin))
-    allocate(next_empty(Ntor, n_elements, element_part_s*element_part_t))
-
-    particles_in_volume(:,:,:,:) = 0
-    next_empty(:,:,:) = 1
-
-    do k = 1, n_part
-      call get_spatial_bin(p_gc_array(k), j, h, g, lin)
-      i = p_gc_array(k)%i_elm
-      particles_in_volume(j,i,lin, next_empty(j,i,lin)) = k
-      next_empty(j,i,lin) = next_empty(j,i,lin) + 1
+    allocate(pa_polymorphic(size(p_gc_array)), source=p_gc_array)
+    do i = 1, size(p_gc_array)
+      pa_polymorphic(i) = p_gc_array(i)
     end do
+
+    call sort_particles_in_elm(pa_polymorphic, n_elements, sorted_by_elm, pa_in_elm)
+
+    allocate(vol_bin_start(Ntor+1, n_elements, element_part_s*element_part_t))
+    vol_bin_start(:,:,:) = 0
+
+    n_lin = element_part_s * element_part_t
+    offset = 1          ! 1-based
+    do lin = 1, n_lin
+      do i = 1, n_elements
+        do j = 1, Ntor
+          vol_bin_start(j, i, lin) = offset
+          offset = offset + amount_markers_spatial_bin(j, i, lin)
+        end do
+        vol_bin_start(Ntor+1, i, lin) = offset
+      end do
+    end do
+    ! sentinel: one-past-the-end for the last bin
+    ! (we store it in the extra +1 slot for uniform access)
+    ! total markers = offset - 1 = n_part (locally)
+    !do lin = 1, n_lin
+    !  do i = 1, n_elements
+    !    vol_bin_start(Ntor+1, i, lin) = offset
+    !  end do
+    !end do
+
+    ! Allocate the flat index array (one entry per local marker)
+    allocate(vol_bin_idx(n_part))
+    vol_bin_idx(:) = 0
+
+    n_lin = element_part_s * element_part_t
+
+    !$omp parallel do default(none)                                       &
+    !$omp shared(n_elements, pa_in_elm, sorted_by_elm, p_gc_array,        &
+    !$omp        vol_bin_start, vol_bin_idx, n_lin, Ntor, n_part, sim, amount_markers_spatial_bin)                  &
+    !$omp private(i, k, j, h, g, lin, local_next, km)                          &
+    !$omp schedule(dynamic, 1)
+    do i = 1, n_elements
+      if (pa_in_elm(i) .eq. 0) cycle
+
+      ! local_next is private to this thread's iteration of element i
+      allocate(local_next(Ntor, n_lin))
+      local_next(:,:) = 0
+
+      do k = 1, pa_in_elm(i)
+          km = sorted_by_elm(i)%pa_ind(k)
+          call get_spatial_bin(p_gc_array(km), j, h, g, lin)
+          ! position in vol_bin_idx = base offset for (j,i,lin) + how many we've
+          ! already inserted from this element (other elements don't share a bin
+          ! with this element, so local_next is race-free)
+          if ((vol_bin_start(j, i, lin) + local_next(j, lin)) .gt. n_part) then
+            write(*,*) 'ERROR: cant write into vol_bin_ix'
+            write(*,*) 'ERROR cont.', sim%my_id, i, pa_in_elm(i), amount_markers_spatial_bin(j,i,lin), vol_bin_start(j,i,lin), local_next(j, lin)
+          end if 
+          vol_bin_idx( vol_bin_start(j, i, lin) + local_next(j, lin) ) = km
+          local_next(j, lin) = local_next(j, lin) + 1
+      end do
+
+      deallocate(local_next)
+    end do
+    !$omp end parallel do
 
     end_time = MPI_WTIME()
     tot_time = mpi_minmeanmax(end_time-start_time)
@@ -475,7 +610,8 @@ contains
 
             if (mu_min(j,i,h,g) .le. 0.d0) mu_min(j,i,h,g) = 0.d0
 
-            if (particles_in_volume(j,i,lin,1) .eq. 0) cycle
+            !if (particles_in_volume(j,i,lin,1) .eq. 0) cycle
+            if (amount_markers_spatial_bin(j, i, lin) .eq. 0) cycle
 
             if (p_para_max(j,i,h,g) .lt. p_para_min(j,i,h,g)) write(*,*) 'p_para_max < p_para_min'
             if (mu_max(j,i,h,g) .lt. mu_min(j,i,h,g)) write(*,*) 'mu_max < mu_min'
@@ -492,11 +628,12 @@ contains
             if (mu_min(j,i,h,g) .lt. 0.d0) mu_min(j,i,h,g) = 0.d0
 
             weighttot = 0.d0
-            p_para_mu_array(:) = 0.d0
 
-            do k = 1, max_markers_bin
-                km = particles_in_volume(j,i,lin,k)
-                if (km .eq. 0) exit
+            if((vol_bin_start(j+1, i, lin) - 1 - vol_bin_start(j, i, lin)) .gt. amount_markers_spatial_bin(j,i,lin)) then 
+              write(*,*) 'ERROR, more markers in bin than possible according to amount markers', vol_bin_start(j, i, lin), vol_bin_start(j+1, i, lin), amount_markers_spatial_bin(j,i,lin)
+            end if 
+            do k = vol_bin_start(j, i, lin), vol_bin_start(j+1, i, lin) - 1
+                km = vol_bin_idx(k)
                 if (p_gc_array(km)%weight .lt. 0.d0) then
                   write(*,*) 'There is a particle with negative weight'
                   cycle
@@ -507,10 +644,9 @@ contains
                 kii = INT((p_gc_array(km)%p(1) - p_para_min(j,i,h,g))/(p_para_max(j,i,h,g) - p_para_min(j,i,h,g))*Nbin+1)
                 kjj = INT((p_gc_array(km)%p(2) - mu_min(j,i,h,g))/(mu_max(j,i,h,g) - mu_min(j,i,h,g))*Nbin+1)
 
-                p_para_mu_array(kjj+(kii-1)*Nbin) = p_para_mu_array(kjj+(kii-1)*Nbin) + p_gc_array(km)%weight
+                p_para_mu_array(kjj+(kii-1)*Nbin,j,i,h,g) = p_para_mu_array(kjj+(kii-1)*Nbin,j,i,h,g) + p_gc_array(km)%weight
             end do
 
-            p_para_mu_array2(:,j,i,h,g) = p_para_mu_array(:)
             weighttot2(j,i,h,g) = weighttot
 
           end do
@@ -518,8 +654,9 @@ contains
       end do
     end do
 
-    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_mu_array2, size(p_para_mu_array2), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, weighttot2, size(weighttot2), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, amount_markers_spatial_bin, size(amount_markers_spatial_bin), MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, p_para_mu_array, size(p_para_mu_array), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, weighttot2, size(weighttot2), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
 
     end_time = MPI_WTIME()
     tot_time = mpi_minmeanmax(end_time-start_time)
@@ -543,33 +680,42 @@ contains
             weighttot = weighttot2(j,i,h,g)
             if (weighttot .eq. 0.d0) cycle
 
+
+
             ! --- Case 1: a single marker (globally) in this volume bin: copy it unchanged.
             ! (The per-bin MPI_ALLREDUCE weight check of the old version was removed here.)
             if (amount_markers_spatial_bin(j,i,lin) .eq. 1) then
-              if (particles_in_volume(j,i,lin,1) .gt. 0) then
-                if (index .gt. n_limit) stop 'ERROR do_binning_mpi: particle array full while placing markers'
-                p_gc = p_gc_array(particles_in_volume(j,i,lin,1))
-                call sim%fields%calc_EBpsiU(sim%time, i, p_gc%st, p_gc%x(3), E, B, psi, U)
-                parts(index) = relativistic_gc_to_relativistic_kinetic(sim%fields%node_list, sim%fields%element_list, &
-                                                                       p_gc, sim%groups(group_num)%mass, B, 0.d0)
-                if (parts(index)%i_elm .le. 0) write(*,*) 'Single particle has been placed outside domain', parts(index)%i_elm, p_gc%i_elm
-                index = index + 1
+              if (vol_bin_start(j+1,i,lin) .gt. vol_bin_start(j,i,lin)) then   ! bin is non-empty
+                p_gc = p_gc_array(vol_bin_idx(vol_bin_start(j,i,lin)))
+                select type (p => sim%groups(group_num)%particles(index))
+                type is (particle_kinetic_relativistic)
+                  call sim%fields%calc_EBpsiU(sim%time, i, p_gc%st, p_gc%x(3), E, B, psi, U)
+                  p = relativistic_gc_to_relativistic_kinetic(sim%fields%node_list, sim%fields%element_list, &
+                                                                        p_gc, sim%groups(group_num)%mass, B, 0.d0)
+                  if (p%i_elm .le. 0) write(*,*) 'Single particle has been placed outside domain', p%i_elm, p_gc%i_elm
+                type is (particle_gc_relativistic)
+                  p = p_gc
+                end select 
+                index = index+1
               end if
               cycle
             end if
 
             ! --- Case 2: fewer markers in the bin than would be newly created: copy them all unchanged.
             if (new_markers_per_element .gt. amount_markers_spatial_bin(j,i,lin)) then
-              do n = 1, amount_markers_spatial_bin(j,i,lin)
-                km = particles_in_volume(j,i,lin,n)
-                if (km .eq. 0) exit
-                if (index .gt. n_limit) stop 'ERROR do_binning_mpi: particle array full while placing markers'
+              do k = vol_bin_start(j, i, lin), vol_bin_start(j+1, i, lin) - 1
+                km = vol_bin_idx(k)
                 p_gc = p_gc_array(km)
-                call sim%fields%calc_EBpsiU(sim%time, i, p_gc%st, p_gc%x(3), E, B, psi, U)
-                parts(index) = relativistic_gc_to_relativistic_kinetic(sim%fields%node_list, sim%fields%element_list, &
-                                                                       p_gc, sim%groups(group_num)%mass, B, 0.d0)
-                if (parts(index)%i_elm .le. 0) write(*,*) 'Multiple but not resampled particle has been placed outside domain', parts(index)%i_elm, p_gc%i_elm
-                index = index + 1
+                select type (p => sim%groups(group_num)%particles(index))
+                type is (particle_kinetic_relativistic)
+                  call sim%fields%calc_EBpsiU(sim%time, i, p_gc%st, p_gc%x(3), E, B, psi, U)
+                  p = relativistic_gc_to_relativistic_kinetic(sim%fields%node_list, sim%fields%element_list, &
+                                                                        p_gc, sim%groups(group_num)%mass, B, 0.d0)
+                  if (p%i_elm .le. 0) write(*,*) 'Multiple but not resampled particle has been placed outside domain', p%i_elm, p_gc%i_elm
+                type is (particle_gc_relativistic)
+                  p = p_gc
+                end select
+                index = index+1
               end do
               cycle
             end if
@@ -591,10 +737,10 @@ contains
             end if
 
             ! Normalize the histogram to probabilities and build the cumulative sum for inversion sampling
-            p_para_mu_array2(:,j,i,h,g) = p_para_mu_array2(:,j,i,h,g)/weighttot
-            cum_prob(1) = p_para_mu_array2(1,j,i,h,g)
+            p_para_mu_array(:,j,i,h,g) = p_para_mu_array(:,j,i,h,g)/weighttot
+            cum_prob(1) = p_para_mu_array(1,j,i,h,g)
             do m = 2, size(cum_prob)
-              cum_prob(m) = cum_prob(m-1) + p_para_mu_array2(m,j,i,h,g)
+              cum_prob(m) = cum_prob(m-1) + p_para_mu_array(m,j,i,h,g)
             end do
             if (abs(cum_prob(size(cum_prob)) - 1.d0) .gt. 1.d-6) write(*,*) 'last value cum_prob:', cum_prob(size(cum_prob))
 
@@ -609,35 +755,22 @@ contains
 
             A_RZ = (Rbox(2) - Rbox(1))*(Zbox(2)-Zbox(1))
 
-            do n=1, new_markers_per_element_loop
-              if (index .gt. n_limit) stop 'ERROR do_binning_mpi: particle array full while placing markers'
+            select type (parts => sim%groups(group_num)%particles)
+            type is (particle_kinetic_relativistic)
 
+            do n=1, new_markers_per_element_loop
               ! Select momentum bin l by inversion sampling of the cumulative probabilities
               call rng1%next(rand)
               l = minloc(cum_prob, dim=1, mask=((rand(1) .gt. [0.d0, cum_prob(1:(size(cum_prob)-1))]) .and. (rand(1) .le. cum_prob)))
 
               ! Decode l = kjj + (kii-1)*Nbin into the p_para bin kii and the mu bin kjj, and
               ! draw p_para and mu uniformly within that bin
-              ! (replaces the modulo() special-casing of the old version; identical values)
-
               call rng2%next(ran_p_mu)
-                  p_para = (1/real(Nbin,8)*(real(l,8)-real(modulo(l,Nbin),8))+1.d0 -ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
-                  if (modulo(l,Nbin) .eq. 0) p_para = (real(l,8)/real(Nbin,8)-ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+              kii = (l-1)/Nbin +1 
+              kjj = modulo(l-1, Nbin) + 1
 
-                  mu = (real(modulo(l,Nbin), 8) -ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
-                  if (modulo(l,Nbin) .eq. 0) mu = (real(Nbin,8) -ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
-
-            !!  call rng2%next(ran_p_mu)
-            !!  !kii = (l-1)/Nbin + 1
-            !!  kii = int((real(l,8) - real(modulo(l,Nbin),8))/real(Nbin,8) + 1,4)
-            !!  kjj = modulo(l-1, Nbin) + 1
-            !!  !kjj = modulo(l,Nbin)
-            !!  if (modulo(l,Nbin) .eq. 0.d0) then
-            !!    kii = int(real(l,8)/real(Nbin,8),4)
-            !!    kjj = Nbin
-            !!  end if 
-            !!  p_para = (real(kii,8) - ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
-            !!  mu     = (real(kjj,8) - ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)
+              p_para = (real(kii,8) - ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+              mu     = (real(kjj,8) - ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)              
 
               if (mu .le. 0.d0) write(*,*) 'mu is zero or negative', mu, 'mu_max', mu_max(j,i,h,g), 'mu_min', mu_min(j,i,h,g), 'p_para', p_para
 
@@ -684,13 +817,70 @@ contains
               p_gc%q    = -1
 
               ! Convert the new GC marker to a kinetic (FO) marker.
-              ! (The old version converted the result back to GC into an unused variable here,
-              !  costing two extra field evaluations per marker; removed.)
               call sim%fields%calc_EBpsiU(sim%time, i, p_gc%st, p_gc%x(3), E, B, psi, U)
               parts(index) = relativistic_gc_to_relativistic_kinetic(sim%fields%node_list, sim%fields%element_list, &
                                                                      p_gc, sim%groups(group_num)%mass, B, gyro_angle(1))
               index = index + 1
             end do ! new markers
+
+            type is (particle_gc_relativistic)
+
+            do n=1, new_markers_per_element_loop
+              ! Select momentum bin l by inversion sampling of the cumulative probabilities
+              call rng1%next(rand)
+              l = minloc(cum_prob, dim=1, mask=((rand(1) .gt. [0.d0, cum_prob(1:(size(cum_prob)-1))]) .and. (rand(1) .le. cum_prob)))
+
+              ! Decode l = kjj + (kii-1)*Nbin into the p_para bin kii and the mu bin kjj, and
+              ! draw p_para and mu uniformly within that bin
+              call rng2%next(ran_p_mu)
+              kii = (l-1)/Nbin +1 
+              kjj = modulo(l-1, Nbin) + 1
+
+              p_para = (real(kii,8) - ran_p_mu(1))*(p_para_max(j,i,h,g)-p_para_min(j,i,h,g))/real(Nbin,8) + p_para_min(j,i,h,g)
+              mu     = (real(kjj,8) - ran_p_mu(2))*(mu_max(j,i,h,g)-mu_min(j,i,h,g))/real(Nbin,8) + mu_min(j,i,h,g)              
+
+              if (mu .le. 0.d0) write(*,*) 'mu is zero or negative', mu, 'mu_max', mu_max(j,i,h,g), 'mu_min', mu_min(j,i,h,g), 'p_para', p_para
+
+              ! Weight of the new markers: conserves the total weight of the volume bin
+              parts(index)%q = -1
+              if (new_markers_per_element .le. amount_processes) then
+                parts(index)%weight = weighttot/real(new_markers_per_element,8)
+              else
+                parts(index)%weight = weighttot/(real(new_markers_per_element/amount_processes,8)*real(amount_processes,8))
+              end if
+
+              ! Position: uniform in (R,Z) within sub-element (h,g) of element i, by rejection
+              ! sampling with the Jacobian of the (s,t)->(R,Z) map
+              do
+                call rng%next(ran)
+                ran(2) = real(h-1,8)/real(element_part_s,8) + ran(2)/real(element_part_s,8)
+                ran(3) = real(g-1,8)/real(element_part_t,8) + ran(3)/real(element_part_t,8)
+                call interp_RZ(sim%fields%node_list, sim%fields%element_list, i, ran(2), ran(3), R, R_s, R_t, Z, Z_s, Z_t)
+                f = abs(R_s*Z_t - R_t*Z_s)/A_RZ
+                if (ran(1) .le. f) exit
+              end do
+              phi = 2.d0*Pi/real(Ntor,8)*ran(4) + 2.d0*Pi/real(Ntor,8)*(real(j,8)-1.d0)
+
+              call rng1%next(gyro_angle)
+              gyro_angle(1) = gyro_angle(1)*2.d0*pi
+
+              parts(index)%x(1)  = R
+              parts(index)%x(2)  = Z
+              parts(index)%x(3)  = phi
+              parts(index)%st(1) = ran(2)
+              parts(index)%st(2) = ran(3)
+
+              call find_RZ(sim%fields%node_list,sim%fields%element_list,parts(index)%x(1),parts(index)%x(2),DUMMY_REAL,DUMMY_REAL,parts(index)%i_elm,parts(index)%st(1),parts(index)%st(2),ifail)
+              if (parts(index)%i_elm .ne. i) write(*,*) 'element numbers do not match'
+
+              parts(index)%p(1) = p_para
+              parts(index)%p(2) = mu
+              parts(index)%q    = -1
+
+              index = index + 1
+            end do ! new markers
+
+          end select
 
           end do
         end do
@@ -706,24 +896,29 @@ contains
     ! --------------------------------------------------------------------------------
     ! Finalize: deactivate the remaining slots and reset emptyind
     ! --------------------------------------------------------------------------------
-    parts(index:n_limit)%i_elm  = 0
-    parts(index:n_limit)%weight = 0.d0
+    sim%groups(group_num)%particles(index:n_limit)%i_elm  = 0
+    sim%groups(group_num)%particles(index:n_limit)%weight = 0.d0
 
-    n_part = count(parts(:)%i_elm .gt. 0)
+    n_part = count(sim%groups(group_num)%particles(:)%i_elm .gt. 0)
 
     if (sim%my_id .eq. 0) write(*,*) 'npart', n_part
-    if (sim%my_id .eq. 0) write(*,*) 'Total weight at end do binning', sum(parts(:)%weight)
+    if (sim%my_id .eq. 0) write(*,*) 'Total weight at end do binning', sum(sim%groups(group_num)%particles(:)%weight)
 
     ! all active markers are now stored contiguously from index 1, so the identity is sorted
     emptyind = (/(l, l=1,n_limit, 1)/)
 
-    class default
-      if (sim%my_id .eq. 0) write(*,*) 'ERROR: do_binning_mpi requires particles of type particle_kinetic_relativistic. Aborting.'
-      stop
-    end select
-
-    ! (allocatables are deallocated automatically on return; the explicit deallocate
-    !  block of the old version was removed)
+    deallocate(p_para_min)
+    deallocate(p_para_max)
+    deallocate(mu_min)
+    deallocate(mu_max)
+    deallocate(p_para_mu_array)
+    deallocate(weighttot2)
+    deallocate(amount_markers_spatial_bin)
+    deallocate(p_gc_array)
+    deallocate(vol_bin_start)
+    deallocate(vol_bin_idx)
+    deallocate(sorted_by_elm)
+    deallocate(pa_in_elm)
 
   contains
 
@@ -845,11 +1040,16 @@ contains
 
     class(type_re_avalanche), intent(inout) :: this
     type(particle_sim),  intent(inout) :: sim
+    type(count_action) :: counter
 
-    integer*4 :: n_part, n_limit
-    integer*4 :: iterations=5
+    integer*4 :: n_part, n_limit, n_part_total
+    integer*4 :: iterations=10
     real*8 :: start_time, end_time, tot_time(3)
     real*8 :: dt_coll
+    logical :: resample
+    integer*4 :: amount_processes, ierr
+
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, amount_processes, ierr)
 
     if(.not. this%constructed) then
       if(sim%my_id.eq.0) write(*,*) 'ERROR: Something went wrong in initializing RE avalanche. Aborting.'
@@ -858,11 +1058,18 @@ contains
 
     call reorder_indices(sim, this%group_num, this%emptyind)
 
+    resample = .false. 
+
     n_part = count(sim%groups(this%group_num)%particles(:)%i_elm .gt. 0)
+    if (sim%my_id .eq. 0) write(*,*) 'Amount living particles, id'
+    write(*,*) n_part, sim%my_id
+    n_part_total = n_part
+    call MPI_ALLREDUCE(MPI_IN_PLACE, n_part_total, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, ierr)
     n_limit = this%n_limit
+    if (3*n_part_total .gt. n_limit*amount_processes) resample = .true.
 
     ! Resample when the tripling by the knock-on collisions would no longer fit
-    if (3*n_part .gt. n_limit) then
+    if (resample) then
       if(sim%my_id .eq. 0) write(*,*) "Start resampling, necessary as n_part = ", n_part," and n_limit = ", n_limit
       start_time = MPI_WTIME()
 
@@ -878,8 +1085,11 @@ contains
 
       n_part = count(sim%groups(this%group_num)%particles(:)%i_elm .gt. 0)
       if (3*n_part .gt. n_limit) then
-        write(*,*) 'Settings of the resampling do not allow for a large enough decrease in amount of markers. Consider tuning the settings to have less volume bins or increase the size of the particle group.'
-        stop
+         if (sim%my_id .eq. 0) then 
+          write(*,*) 'Settings of the resampling do not allow for a large enough decrease in amount of markers. Consider tuning the settings to have less volume bins or increase the size of the particle group.'
+          write(*,*) 'After resampling and locally on id 0; n_part = ', n_part, ', n_limit = ', n_limit
+         end if 
+         stop
       end if
     end if
 
@@ -889,8 +1099,10 @@ contains
       dt_coll = this%each_nstep_part*sim%tstep_part_adj
     endif
 
+    if (sim%my_id .eq. 0) write(*,*) 'Doing the knock-on collisions ...'
     start_time = MPI_WTIME()
     call Moller_scatt(sim, this%group_num, this%gamma_min, dt_coll, n_part, this%emptyind)
+    call with(sim, counter)
     end_time = MPI_WTIME()
     tot_time = mpi_minmeanmax(end_time-start_time)
     if (sim%my_id .eq. 0) then
