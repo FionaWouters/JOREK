@@ -1023,7 +1023,7 @@ contains
     this%Nmombin = Nmombin
     this%each_nstep_part = each_nstep_part
 
-    if (each_nstep_part .ne. -9999991) then
+    if (each_nstep_part .ne. 0) then
       call sim%update_lcm_gcd(each_nstep_part)
       if(gcd_re_avalanche .eq. -9999991) then
         gcd_re_avalanche = each_nstep_part
