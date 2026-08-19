@@ -642,7 +642,7 @@ mpi_comm_in,mpi_info_in,test_in)
           write(*,*) " ----------------------------------------------- "
         endif
 
-        if (config%n_particles .gt. n_particles_tot(1)) then 
+        if (sum(live_n_particles_per_mpi_array(:)) .lt. config%n_particles) then 
           offset = int(sum(live_n_particles_per_mpi_array(1:sim%my_id)),kind=HSIZE_T)
           n_particles_hsizet = int(live_n_particles_per_mpi_array(sim%my_id+1),kind=HSIZE_T)
         else 
