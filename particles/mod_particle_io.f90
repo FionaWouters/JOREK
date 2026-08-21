@@ -642,7 +642,7 @@ mpi_comm_in,mpi_info_in,test_in)
           write(*,*) " ----------------------------------------------- "
         endif
 
-        if (sum(live_n_particles_per_mpi_array(:)) .lt. config%n_particles) then 
+        if ((sum(live_n_particles_per_mpi_array(:)) .lt. config%n_particles) .and. (sum(live_n_particles_per_mpi_array(:)) .gt. 0)) then 
           offset = int(sum(live_n_particles_per_mpi_array(1:sim%my_id)),kind=HSIZE_T)
           n_particles_hsizet = int(live_n_particles_per_mpi_array(sim%my_id+1),kind=HSIZE_T)
         else 
@@ -710,7 +710,7 @@ mpi_comm_in,mpi_info_in,test_in)
         call HDF5_allocatable_array3D_reading(file_id,dAstar_k_arr,trim(group_name)//"dAstar_k",&
         reqdims_in=[n1_HSIZE_T,n1_HSIZE_T,n_particles_hsizet],start=[i0_HSIZE_T,i0_HSIZE_T,offset])
         !> fill particle list from arrays
-        call particle_list_from_arrays(live_n_particles_per_mpi_arrayn_particles_per_mpi_array(sim%my_id+1),sim%groups(i)%particles,ierr,&
+        call particle_list_from_arrays(live_n_particles_per_mpi_array(sim%my_id+1),sim%groups(i)%particles,ierr,&
         i_elm_arr=i_elm_arr,i_life_arr=i_life_arr,t_birth_arr=t_birth_arr,weight_arr=weight_arr,&
         x_arr=x_arr,st_arr=st_arr,q_arr=q_arr,v_1d_arr=v_1d_arr,E_arr=E_arr,mu_arr=mu_arr,&
         vpar_arr=vpar_arr,B_norm_arr=B_norm_arr,vpar_m_arr=vpar_m_arr,B_hat_prev_arr=B_hat_prev_arr,&
