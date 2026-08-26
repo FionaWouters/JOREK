@@ -142,7 +142,9 @@ do i=1, element_list%n_elements
             write(*,*) ' first solution : ',s,iv,i,ifound
           endif
 
-          call flux_surface_add_point(node_list,element_list,surface_list,s,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          if (ifound <= 4) then
+            call flux_surface_add_point(node_list,element_list,surface_list,s,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          end if 
 
         endif
 
@@ -155,7 +157,9 @@ do i=1, element_list%n_elements
             write(*,*) ' second solution : ',s2,iv,i,ifound
           endif
 
-          call flux_surface_add_point(node_list,element_list,surface_list,s2,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          if (ifound <= 4) then
+            call flux_surface_add_point(node_list,element_list,surface_list,s2,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          end if 
 
           if (abs(s3) .le. 1.d0)         write(*,*) ' WARNING another solution : ',s3,i
 
@@ -170,7 +174,9 @@ do i=1, element_list%n_elements
             write(*,*) ' third solution : ',s3,iv,i,ifound
           endif
 
-          call flux_surface_add_point(node_list,element_list,surface_list,s3,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          if (ifound <= 4) then
+            call flux_surface_add_point(node_list,element_list,surface_list,s3,i,iv,ifound,r_psi,s_psi,dpsi_dr,dpsi_ds)
+          end if
 
         endif
 

@@ -929,6 +929,19 @@ part_group_configs(:)%num_re                 = 0.d0
 part_group_configs(:)%re_energy              = 0.d0
 part_group_configs(:)%re_std_energy          = 0.d0
 part_group_configs(:)%re_pitch               = 0.d0
+part_group_configs(:)%use_re_avalanche       = .false.
+do i=1,n_part_groups_max
+  part_group_configs(i)%res_st_bin(:)        = 1
+end do
+part_group_configs(:)%res_phi_bin            = 1
+part_group_configs(:)%gamma_min              = 0.d0
+part_group_configs(:)%new_markers_per_spatial_bin = 0
+part_group_configs(:)%bins_per_mom_direction = 1
+part_group_configs(:)%reava_each_nstep_part  = 0
+part_group_configs(:)%use_radreact           = .false.
+part_group_configs(:)%use_ccoll              = .false.
+part_group_configs(:)%use_partial_screening  = .false.
+
 
 !----- specific to epf
 part_group_configs(:)%T_maxwell              = 0.d0
