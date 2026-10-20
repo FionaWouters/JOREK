@@ -1,4 +1,6 @@
 #include "particles/mod_fields_linear/fields_linear.h"
+#include "particles/pushers/mod_ccoll_relativistic/coronal.h"
+#include "particles/pushers/mod_ccoll_relativistic/ccoll_relativistic.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -37,14 +39,61 @@ extern "C" {
                                    const int32_t i_elm0,
                                    const double s, const double t, const double phi,
                                    const double time,
-                                   double* ne, double* Te) {
+                                   // NEW: ccoll scalars
+                                    const int32_t  n_ions,
+                                    const double   m_i_over_m_imp,
+                                    const int32_t  var_rho,
+                                    const int32_t  var_T,
+                                    const int32_t  var_Ti,
+                                    const int32_t  var_Te,
+                                    const int32_t  var_rhoimp,
+                                    // NEW: coronal table (null/zero when no impurities)
+                                    const int32_t  cor_n_d,
+                                    const int32_t  cor_n_T,
+                                    const int32_t  cor_n_Z,
+                                    const double*  cor_density,
+                                    const double*  cor_temperature,
+                                    const double*  cor_Z,
+                                    double* ne, double* Te, 
+                                    double* ni, double* Ti) {
 
         const auto f = jorek::fields_linear_set_from_registry(
             el_base, static_cast<std::size_t>(n_elements),
             nd_base, static_cast<std::size_t>(n_nodes),
             interp_base);
 
-        f.calc_NjTj(time, static_cast<std::size_t>(i_elm0), s, t, phi, *ne, *Te);
+        const double dummy_mi[ccoll::MAX_ION_SPECIES] = {};
+        const double dummy_Z0[ccoll::MAX_ION_SPECIES] = {};
+        const auto dat = ccoll::make_ccoll_table<double>(
+            0, 0, nullptr, nullptr, nullptr, nullptr,
+            static_cast<int>(n_ions), dummy_mi, dummy_Z0,
+            m_i_over_m_imp,
+            static_cast<int>(var_rho),
+            static_cast<int>(var_T),
+            static_cast<int>(var_Ti),
+            static_cast<int>(var_Te),
+            static_cast<int>(var_rhoimp));
+
+        // Build coronal table -- handles both cases:
+        // with_impurities=.false.: cor_n_d==0, returns default null table
+        // with_impurities=.true.:  builds table from the flat arrays
+        const coronal::coronal_table<double> cor =
+            (cor_n_d > 0)
+            ? coronal::make_coronal_table<double>(
+                static_cast<int>(cor_n_d),
+                static_cast<int>(cor_n_T),
+                static_cast<int>(cor_n_Z),
+                cor_density, cor_temperature, cor_Z)
+            : coronal::coronal_table<double>{};
+
+        double ni_arr[ccoll::MAX_ION_SPECIES] = {};
+        double Ti_val = 0.0;
+
+        f.calc_NjTj(time, static_cast<std::size_t>(i_elm0), s, t, phi, dat, cor, *ne, *Te, ni_arr, Ti_val);
+
+        *Ti = Ti_val;
+        for (int i = 0; i < static_cast<int>(n_ions); ++i)
+            ni[i] = ni_arr[i];
     }
 
     /* mod_fields::grad_st_to_RZ. */

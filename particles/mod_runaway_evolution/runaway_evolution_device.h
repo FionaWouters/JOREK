@@ -27,9 +27,26 @@ typedef struct jgx_re_ccoll_args {
     const double* theta;  /*< (nth) */
     const double* L0;     /*< (nu, nth) */
     const double* L1;     /*< (nu, nth) */
-    double        mi;     /*< main ion mass [kg] */
-    double        Z0;     /*< main ion charge number [1] */
+    int32_t       n_ions;
+    const double* mi;     /*< main ion mass [kg] */
+    const double* Z0;     /*< main ion charge number [1] */
+    double        m_i_over_m_imp;
+    int32_t       var_rho;
+    int32_t       var_T;
+    int32_t       var_Ti;
+    int32_t       var_Te;
+    int32_t       var_rhoimp;
 } jgx_re_ccoll_args;
+
+// New struct for coronal table (add alongside):
+typedef struct jgx_re_cor_args {
+    int32_t       n_d;          // size(imp_cor(1)%density),     0 if no impurities
+    int32_t       n_T;          // size(imp_cor(1)%temperature), 0 if no impurities
+    int32_t       n_Z;          // imp_cor(1)%n_Z,               0 if no impurities
+    const double* density;      // c_loc(imp_cor(1)%density(1)),     null if no impurities
+    const double* temperature;  // c_loc(imp_cor(1)%temperature(1)), null if no impurities
+    const double* Z;            // c_loc(imp_cor(1)%Z(1,1,0)),       null if no impurities
+} jgx_re_cor_args;
 
 /**
  * evolve_REs on the device: pack, upload, launch, pull, download, free.
@@ -56,6 +73,7 @@ void jgx_device_runaway_evolution_evolve_REs(
     double* rhs_data, const size_t* rhs_ext, const size_t* idx,
     double mass, double time, double timestep, int32_t nstep, double phi_search,
     int32_t use_ccoll, int32_t use_radreact, const jgx_re_ccoll_args* ccoll,
+    const jgx_re_cor_args* cor,
     int64_t rng_seed, int64_t rng_stream_base,
     int32_t* not_found, double* nf_R, double* nf_Z,
     int32_t* bad_i_from, int32_t* bad_i_to);

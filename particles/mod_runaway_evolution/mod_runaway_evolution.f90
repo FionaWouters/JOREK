@@ -4,13 +4,13 @@ module mod_runaway_evolution
     use particle_tracer
     use coupling_variables
     use mod_ccoll_relativistic, only: ccoll_data, ccoll_init
-    use phys_module, only: use_manual_random_seed, part_group_configs
+    use phys_module, only: use_manual_random_seed, part_group_configs, imp_cor
     use, intrinsic :: iso_c_binding, only: c_int64_t
     !$ use omp_lib
 
     implicit none
     private
-    public :: evolve_REs !< public for regtesting, used by evolve_particle_group
+    public :: evolve_REs, re_ccoll_data !< public for regtesting, used by evolve_particle_group
 
     !> Spacing between the generator stream ids of two MPI ranks.
     !>
@@ -45,7 +45,16 @@ module mod_runaway_evolution
                                       ccoll_nu, ccoll_nth,    &
                                       ccoll_u, ccoll_theta,   &
                                       ccoll_L0, ccoll_L1,     &
+                                      ccoll_n_ions,           &
                                       ccoll_mi, ccoll_Z0,     &
+                                      ccoll_m_i_over_m_imp,   &
+                                      var_rho, var_T,         &
+                                      var_Ti, var_Te,         &
+                                      var_rhoimp,             &
+                                      cor_n_d, cor_n_T,       &
+                                      cor_n_Z, cor_density,   &
+                                      cor_temperature,        &
+                                      cor_Z,                  &
                                       rng_seed, rng_stream_base, &
                                       not_found, nf_R, nf_Z,  & !> debug
                                       bad_i_from, bad_i_to) bind(C)
@@ -60,7 +69,16 @@ module mod_runaway_evolution
         integer(c_int32_t), value, intent(in)  :: use_ccoll, use_radreact
         integer(c_int32_t), value, intent(in)  :: ccoll_nu, ccoll_nth
         type(c_ptr),        value, intent(in)  :: ccoll_u, ccoll_theta, ccoll_L0, ccoll_L1
-        real(c_double),     value, intent(in)  :: ccoll_mi, ccoll_Z0
+        integer(c_int32_t), value, intent(in)  :: ccoll_n_ions          ! NEW
+        type(c_ptr),        value, intent(in)  :: ccoll_mi, ccoll_Z0
+        real(c_double),     value, intent(in)  :: ccoll_m_i_over_m_imp  ! NEW
+        integer(c_int32_t), value, intent(in) :: var_rho
+        integer(c_int32_t), value, intent(in) :: var_T
+        integer(c_int32_t), value, intent(in) :: var_Ti
+        integer(c_int32_t), value, intent(in) :: var_Te
+        integer(c_int32_t), value, intent(in) :: var_rhoimp
+        integer(c_int32_t), value, intent(in)  :: cor_n_d, cor_n_T, cor_n_Z
+        type(c_ptr),        value, intent(in)  :: cor_density, cor_temperature, cor_Z
         integer(c_int64_t), value, intent(in)  :: rng_seed, rng_stream_base
         integer(c_int32_t),        intent(out) :: not_found, bad_i_from, bad_i_to
         real(c_double),            intent(out) :: nf_R, nf_Z
@@ -85,6 +103,7 @@ contains
     use mod_find_rz_nearby, only: find_RZ_nearby_phi_search, find_RZ_nearby_report
     use mod_particle_types, only: particle_kinetic_relativistic
     use mod_random_seed, only: random_seed
+    use mod_model_settings, only: var_rho, var_T, var_Ti, var_Te, var_rhoimp     ! NEW
     use, intrinsic :: iso_c_binding, only: c_double, c_int32_t, c_int64_t, c_loc, c_null_ptr, c_ptr
 
     implicit none
@@ -101,7 +120,18 @@ contains
     integer(c_int64_t) :: rng_seed
     integer            :: i, seed, ierr
     logical            :: use_ccoll, use_radreact
+    integer(c_int32_t) :: ccoll_n_ions
+    type(c_ptr)        :: ccoll_mi_arr, ccoll_Z0_arr
+    real(c_double)     :: ccoll_m_i_over_m_imp
+    integer(c_int32_t) :: c_var_rho, c_var_T, c_var_Ti, c_var_Te, c_var_rhoimp
+    real(c_double), allocatable, target, save :: ccoll_Z0_real(:)
+    integer(c_int32_t) :: cor_n_d, cor_n_T, cor_n_Z
+    type(c_ptr)        :: cor_density, cor_temperature, cor_Z
     procedure(jgx_evolve_REs_iface), pointer :: evolve_REs_kernel
+
+    real(c_double), allocatable, target, save :: cor_density_copy(:)
+    real(c_double), allocatable, target, save :: cor_temperature_copy(:)
+    real(c_double), allocatable, target, save :: cor_Z_copy(:,:,:)
 
 #if defined(fullmhd) || STELLARATOR_MODEL
     error stop "evolve_REs: the C++ kernel is reduced MHD only (calc_EBpsiU_reduced)"
@@ -123,15 +153,15 @@ contains
     ! not ported at all. Guarded here rather than in the kernel, which cannot
     ! report anything.
     if (use_ccoll) then
-#if defined(WITH_TiTe) || defined(WITH_Impurities)
-      error stop "evolve_REs: use_ccoll needs with_TiTe = .f. and with_impurities = .f."
-#endif
+!#if defined(WITH_TiTe) || defined(WITH_Impurities)
+!      error stop "evolve_REs: use_ccoll needs with_TiTe = .f. and with_impurities = .f."
+!#endif
       if (.not. re_ccoll_ready) then
         call ccoll_init('ccolldata', re_ccoll_data)
         re_ccoll_ready = .true.
       end if
-      if (size(re_ccoll_data%mi) /= 1) &
-        error stop "evolve_REs: the C++ collision operator takes exactly one ion species"
+!      if (size(re_ccoll_data%mi) /= 1) &
+!        error stop "evolve_REs: the C++ collision operator takes exactly one ion species"
     end if
 
     ! One seed for the whole run, drawn on rank 0 and broadcast, as every other
@@ -166,8 +196,95 @@ contains
       ccoll_theta = c_loc(re_ccoll_data%theta(1))
       ccoll_L0    = c_loc(re_ccoll_data%L0(1,1))
       ccoll_L1    = c_loc(re_ccoll_data%L1(1,1))
-      ccoll_mi    = re_ccoll_data%mi(1)
-      ccoll_Z0    = real(re_ccoll_data%Z0(1), 8)   ! integer*1 in ccoll_data
+      !ccoll_mi    = re_ccoll_data%mi(1)
+      !ccoll_Z0    = real(re_ccoll_data%Z0(1), 8)   ! integer*1 in ccoll_data
+      ccoll_n_ions        = int(size(re_ccoll_data%mi), c_int32_t)
+      ccoll_mi_arr        = c_loc(re_ccoll_data%mi(1))
+      if (.not. allocated(ccoll_Z0_real) .or. &
+          size(ccoll_Z0_real) /= size(re_ccoll_data%Z0)) then
+        if (allocated(ccoll_Z0_real)) deallocate(ccoll_Z0_real)
+        allocate(ccoll_Z0_real(size(re_ccoll_data%Z0)))
+      end if
+      ccoll_Z0_real = real(re_ccoll_data%Z0, 8)
+      ccoll_Z0_arr  = c_loc(ccoll_Z0_real(1))
+      ccoll_m_i_over_m_imp = re_ccoll_data%m_i_over_m_imp
+
+      c_var_rho    = int(var_rho - 1, c_int32_t)  ! always active, always var_rho-1
+
+      ! For optional variables: Fortran uses 0 to mean "not active",
+      ! convert to -1 for C++:
+      c_var_T      = merge(int(var_T      - 1, c_int32_t), -1_c_int32_t, var_T      > 0)
+      c_var_Ti     = merge(int(var_Ti     - 1, c_int32_t), -1_c_int32_t, var_Ti     > 0)
+      c_var_Te     = merge(int(var_Te     - 1, c_int32_t), -1_c_int32_t, var_Te     > 0)
+      c_var_rhoimp = merge(int(var_rhoimp - 1, c_int32_t), -1_c_int32_t, var_rhoimp > 0)
+    end if
+
+    cor_n_d         = 0_c_int32_t
+    cor_n_T         = 0_c_int32_t
+    cor_n_Z         = 0_c_int32_t
+    cor_density     = c_null_ptr
+    cor_temperature = c_null_ptr
+    cor_Z           = c_null_ptr
+
+    if (use_ccoll .and. size(re_ccoll_data%mi) > 1) then
+      ! Guard against species with too many charge states for the C++ fixed arrays.
+      ! MAX_CHARGE_STATES = 19 in coronal.h, covers Ne (n_Z=10) and Ar (n_Z=18).
+      if (imp_cor(1)%n_Z > 19) &
+        error stop "evolve_REs: impurity atomic number > 19 not supported in &
+                  &GPU collision operator (covers Ne and Ar only)"
+
+      ! Check the coronal table is actually allocated -- it is filled by
+      ! init_imp_adas, which must be called before evolve_REs.
+      if (.not. allocated(imp_cor(1)%density)) &
+        error stop "evolve_REs: imp_cor(1)%density not allocated -- &
+                  &was init_imp_adas called?"
+      if (.not. allocated(imp_cor(1)%temperature)) &
+        error stop "evolve_REs: imp_cor(1)%temperature not allocated -- &
+                  &was init_imp_adas called?"
+      if (.not. allocated(imp_cor(1)%Z)) &
+        error stop "evolve_REs: imp_cor(1)%Z not allocated -- &
+                  &was init_imp_adas called?"
+
+      ! Pack the three arrays as bare pointers with their extents.
+      ! The C++ side reconstructs jgx::views from these.
+      ! imp_cor(1)%Z is declared as Z(n_d, n_T, 0:n_Z) in the coronal type,
+      ! so c_loc of element (1,1,0) gives the address of the first element.
+      cor_n_d         = int(size(imp_cor(1)%density),     c_int32_t)
+      cor_n_T         = int(size(imp_cor(1)%temperature), c_int32_t)
+      cor_n_Z         = int(imp_cor(1)%n_Z,               c_int32_t)
+
+      ! Copy into target arrays so c_loc can take their address.
+      ! This is the same pattern used for ccoll_Z0_real above.
+      ! The save attribute keeps the memory alive after this subroutine returns,
+      ! which is necessary because the C++ kernel runs asynchronously on the GPU.
+      if (.not. allocated(cor_density_copy) .or. &
+          size(cor_density_copy) /= cor_n_d) then
+        if (allocated(cor_density_copy)) deallocate(cor_density_copy)
+        allocate(cor_density_copy(cor_n_d))
+      end if
+      cor_density_copy = imp_cor(1)%density
+
+      if (.not. allocated(cor_temperature_copy) .or. &
+          size(cor_temperature_copy) /= cor_n_T) then
+        if (allocated(cor_temperature_copy)) deallocate(cor_temperature_copy)
+        allocate(cor_temperature_copy(cor_n_T))
+      end if
+      cor_temperature_copy = imp_cor(1)%temperature
+
+      ! Z has shape (n_d, n_T, 0:n_Z) -- copy the whole 3D array.
+      ! The third dimension runs from 0 to n_Z inclusive = n_Z+1 elements.
+      if (.not. allocated(cor_Z_copy) .or. &
+          size(cor_Z_copy, 1) /= cor_n_d .or. &
+          size(cor_Z_copy, 2) /= cor_n_T .or. &
+          size(cor_Z_copy, 3) /= cor_n_Z + 1) then
+        if (allocated(cor_Z_copy)) deallocate(cor_Z_copy)
+        allocate(cor_Z_copy(cor_n_d, cor_n_T, 0:cor_n_Z))
+      end if
+      cor_Z_copy = imp_cor(1)%Z
+
+      cor_density     = c_loc(cor_density_copy(1))
+      cor_temperature = c_loc(cor_temperature_copy(1))
+      cor_Z           = c_loc(cor_Z_copy(1,1,0))
     end if
 
     ! Logicals cross as int32 and are tested against zero on the other side.
@@ -184,6 +301,7 @@ contains
         !$ call omp_set_schedule(omp_sched_dynamic,10)
       end if
 
+      write(*,*) 'just before entering C++ thingies'
       select type (fi => sim%fields%interp)
       type is (jorek_fields_interp_linear)
         call evolve_REs_kernel(                                                 &
@@ -203,7 +321,11 @@ contains
                c_use_ccoll, c_use_radreact,                                     &
                ccoll_nu, ccoll_nth,                                             &
                ccoll_u, ccoll_theta, ccoll_L0, ccoll_L1,                        &
-               ccoll_mi, ccoll_Z0,                                              &
+               ccoll_n_ions, ccoll_mi_arr, ccoll_Z0_arr, ccoll_m_i_over_m_imp,  &
+               c_var_rho, c_var_T, c_var_Ti, c_var_Te, c_var_rhoimp,            &
+!               ccoll_mi, ccoll_Z0,                                              &
+               cor_n_d, cor_n_T, cor_n_Z,                                       &
+               cor_density, cor_temperature, cor_Z,                         &
                rng_seed, int(sim%my_id, c_int64_t)*rng_rank_stride,             &
                not_found, nf_R, nf_Z, bad_i_from, bad_i_to)
 

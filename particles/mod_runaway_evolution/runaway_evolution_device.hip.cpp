@@ -450,6 +450,7 @@ __global__ void push_kernel(part_set part, fields_set fields, double mass,
  */
 __global__ void collide_kernel(part_set part, fields_set fields,
                                ccoll_table dat,
+                               coronal::coronal_table<double> cor_dev,
                                pcg32::state* __restrict__ rng,
                                double mass, double time, double timestep) {
   const std::size_t ip = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x;
@@ -457,7 +458,7 @@ __global__ void collide_kernel(part_set part, fields_set fields,
   if (part.i_elm(ip) <= 0) return;
 
   pcg32::state my_rng = rng[ip];
-  ccoll::ccoll_kinetic_relativistic_push(dat, part, ip, fields, mass, time,
+  ccoll::ccoll_kinetic_relativistic_push(dat, cor_dev, part, ip, fields, mass, time,
                                          timestep, my_rng);
   rng[ip] = my_rng;  /* the next sort carries it along */
 }
@@ -504,9 +505,19 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
     double* rhs_data, const size_t* rhs_ext, const size_t* idx,
     double mass, double time, double timestep, int32_t nstep, double phi_search,
     int32_t use_ccoll, int32_t use_radreact, const jgx_re_ccoll_args* ccoll_args,
+    const jgx_re_cor_args* cor_args,
     int64_t rng_seed, int64_t rng_stream_base,
     int32_t* not_found, double* nf_R, double* nf_Z,
     int32_t* bad_i_from, int32_t* bad_i_to) {
+
+      // At the start of jgx_device_runaway_evolution_evolve_REs:
+      fprintf(stderr, "cor_args=%p\n", (void*)cor_args);
+      if (cor_args != nullptr) {
+          fprintf(stderr, "cor->n_d=%d cor->n_T=%d cor->n_Z=%d\n",
+                  cor_args->n_d, cor_args->n_T, cor_args->n_Z);
+          fprintf(stderr, "cor->density=%p cor->temperature=%p cor->Z=%p\n",
+                  (void*)cor_args->density, (void*)cor_args->temperature, (void*)cor_args->Z);
+      }
 
   if (n_particles == 0 || n_elements == 0) return;
 
@@ -578,6 +589,17 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
   const std::size_t n_u   = do_ccoll ? std::size_t(ccoll_args->nu)  : 0;
   const std::size_t n_th  = do_ccoll ? std::size_t(ccoll_args->nth) : 0;
 
+  // Coronal dimensions -- zero when with_impurities=.false. (cor_args->n_d==0)
+  // or when ccoll is not used at all.
+  // cor%Z has shape (n_d, n_T, 0:n_Z) in Fortran, so total = n_d*n_T*(n_Z+1)
+  const std::size_t cor_nd       = (do_ccoll && cor_args->n_d > 0) ? std::size_t(cor_args->n_d) : 0;
+  const std::size_t cor_nT       = (do_ccoll && cor_args->n_d > 0) ? std::size_t(cor_args->n_T) : 0;
+  const std::size_t cor_nZ       = (do_ccoll && cor_args->n_d > 0) ? std::size_t(cor_args->n_Z) : 0;
+  const std::size_t cor_nZ_total = cor_nd * cor_nT * (cor_nZ + 1);
+  const std::size_t safe_cor_nd = (cor_nd > 0) ? cor_nd : 1;
+  const std::size_t safe_cor_nT = (cor_nT > 0) ? cor_nT : 1;
+  const std::size_t safe_cor_nZ_total = (cor_nZ_total > 0) ? cor_nZ_total : 1;
+
   const device_buffer rng_a(n_rng * sizeof(pcg32::state));
   const device_buffer rng_b(n_rng * sizeof(pcg32::state));
   pcg32::state* rng_curr = rng_a.as<pcg32::state>();
@@ -587,6 +609,23 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
   const device_buffer tab_th(n_th * sizeof(double));
   const device_buffer tab_L0(n_u * n_th * sizeof(double));
   const device_buffer tab_L1(n_u * n_th * sizeof(double));
+
+  // Coronal buffers -- zero size when with_impurities=.false.
+  // A zero-size device_buffer allocates nothing; the push calls
+  // below are guarded by cor_nd > 0 so they are never called on these.
+  //const device_buffer tab_cor_density    (cor_nd       * sizeof(double));
+  //const device_buffer tab_cor_temperature(cor_nT       * sizeof(double));
+  //const device_buffer tab_cor_Z          (cor_nZ_total * sizeof(double));
+
+  const device_buffer tab_cor_density    (safe_cor_nd       * sizeof(double));
+  const device_buffer tab_cor_temperature(safe_cor_nT       * sizeof(double));
+  const device_buffer tab_cor_Z          (safe_cor_nZ_total * sizeof(double));
+
+  // Diagnostic -- remove after confirming correct:
+  fprintf(stderr, "[ccoll] cor_nd=%zu cor_nT=%zu cor_nZ=%zu cor_nZ_total=%zu\n",
+          cor_nd, cor_nT, cor_nZ, cor_nZ_total);
+  fprintf(stderr, "[ccoll] cor_args->density=%p cor_args->Z=%p\n",
+          (void*)cor_args->density, (void*)cor_args->Z);
 
   ccoll_table ccoll_dev;
   if (do_ccoll) {
@@ -598,7 +637,38 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
         ccoll_args->nu, ccoll_args->nth,
         tab_u.as<double>(), tab_th.as<double>(),
         tab_L0.as<double>(), tab_L1.as<double>(),
-        ccoll_args->mi, ccoll_args->Z0);
+        ccoll_args->n_ions,
+        ccoll_args->mi, ccoll_args->Z0,
+        ccoll_args->m_i_over_m_imp, 
+        static_cast<int>(ccoll_args->var_rho),
+        static_cast<int>(ccoll_args->var_T),
+        static_cast<int>(ccoll_args->var_Ti),
+        static_cast<int>(ccoll_args->var_Te),
+        static_cast<int>(ccoll_args->var_rhoimp));
+  }
+
+  // Coronal table -- built only when impurities are present.
+  // When cor_nd == 0, cor_dev is default-constructed with null views.
+  // The collide_kernel passes it to ccoll_kinetic_relativistic_push
+  // which passes it to calc_NjTj. calc_NjTj only accesses it when
+  // dat.n_ions > 1, which is only true when impurities are present,
+  // so the null table is never dereferenced.
+  coronal::coronal_table<double> cor_dev;
+  if (do_ccoll && cor_nd > 0) {
+      jgx_c_push(tab_cor_density.get(),     cor_args->density,     tab_cor_density.bytes());
+      jgx_c_push(tab_cor_temperature.get(), cor_args->temperature, tab_cor_temperature.bytes());
+      jgx_c_push(tab_cor_Z.get(),           cor_args->Z,           tab_cor_Z.bytes());
+      cor_dev = coronal::make_coronal_table<double>(
+          static_cast<int>(cor_nd),
+          static_cast<int>(cor_nT),
+          static_cast<int>(cor_nZ),
+          tab_cor_density.as<double>(),
+          tab_cor_temperature.as<double>(),
+          tab_cor_Z.as<double>());
+      fprintf(stderr, "[ccoll] coronal table built successfully\n");
+  } else {
+      fprintf(stderr, "[ccoll] coronal table not built (n_ions=%d cor_nd=%zu)\n",
+              do_ccoll ? ccoll_args->n_ions : 0, cor_nd);
   }
 
   /* --- the projection staging --------------------------------------------- */
@@ -660,7 +730,7 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
 
     /* (6) collide, on the momentum the push has just written */
     if (do_ccoll)
-      collide_kernel<<<grid_p, kBlock>>>(curr, fields, ccoll_dev, rng_curr,
+      collide_kernel<<<grid_p, kBlock>>>(curr, fields, ccoll_dev, cor_dev, rng_curr,
                                          mass, time, timestep);
   }
 

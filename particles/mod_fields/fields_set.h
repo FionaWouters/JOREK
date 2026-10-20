@@ -22,6 +22,8 @@
 #include "models/constants/constants.h"
 #include "models/phys_module/phys.h"
 #include "jgx/macros.h"
+#include "particles/pushers/mod_ccoll_relativistic/coronal.h"
+#include "particles/pushers/mod_ccoll_relativistic/ccoll_relativistic.h"
 
 namespace jorek {
 
@@ -168,54 +170,187 @@ struct fields_set {
                  P_R(0), P_Z(0), P_R(1), P_Z(1), P_phi(1), psi_time, E, B);
   } // calc_EBpsiU_reduced
 
+
   /**
-   * type_fields%calc_NjTj -- the background electron density and temperature at
+   * type_fields%calc_NjTj -- background densities and temperatures at
    * (s,t,phi) in element ie.
    *
-   * The with_impurities = .false., with_TiTe = .false. branch.  There the
-   * Fortran's other two outputs are not independent -- ni(1) is ne and Ti is Te
-   * -- so they are not returned, and there is exactly one ion species.  A
-   * caller that needs either of the other branches must not come here;
-   * mod_runaway_evolution.f90 error stops on both.
+   * Covers 4 branches, selected by dat.var_Ti and dat.n_ions:
    *
-   * Unlike calc_EBpsiU_reduced this is not a reduced-MHD restriction: nothing
-   * below depends on the equation set, only on the two model switches.
+   *   dat.var_TI < 0, dat.n_ions == 1 (with_impurities = .f., with_TiTe = .f.)
+   *     Interpolates var_rho and var_T only. ni[0] = ne, Ti = Te.
+   *     cor is not accessed. This is the original C++ path.
    *
-   * @param time   time to interpolate at, SI
-   * @param ie     element index into element_list
+   *   dat.var_TI < 0, dat.n_ions > 1 (with_impurities = .t., with_TiTe = .f.)
+   *     Interpolates var_rho, var_T and var_rhoimp. Main ion density
+   *     from rho minus impurity fraction. Impurity charge state
+   *     populations from coronal equilibrium table via interp_coronal_p.
+   *     cor must be valid (non-null views).
+   * 
+   *   dat.var_TI >= 0, dat.n_ions == 1 (with_impurities = .f., with_TiTe = .t.)
+   *     Interpolates var_rho and var_T only. ni[0] = ne, Ti = Te.
+   *     cor is not accessed. This is the original C++ path.
+   *
+   *   dat.var_TI >= 0, dat.n_ions > 1 (with_impurities = .t., with_TiTe = .t.)
+   *     Interpolates var_rho, var_T and var_rhoimp. Main ion density
+   *     from rho minus impurity fraction. Impurity charge state
+   *     populations from coronal equilibrium table via interp_coronal_p.
+   *     cor must be valid (non-null views).
+   *
+   * Mirrors the Fortran calc_NjTj in mod_fields, with_impurities=.false.
+   * and with_impurities=.true. and with_TiTe=.true. and with_TiTe=.false branches.
+   *
+   * @param time   time [s]
+   * @param ie     element index, 0-based
    * @param s, t   element-local coordinates
    * @param phi    toroidal angle
-   * @param[out] ne  electron density [m^-3], floored at 1e16 as in the Fortran
-   * @param[out] Te  electron temperature [K], floored at 1
+   * @param dat    ccoll table -- carries n_ions and m_i_over_m_imp
+   * @param cor    coronal table -- only accessed when dat.n_ions > 1
+   * @param[out] ne   electron density [m^-3]
+   * @param[out] Te   electron temperature [K]
+   * @param[out] ni   ion densities [m^-3], length dat.n_ions
+   * @param[out] Ti   ion temperature [K]
    */
+  //template<class Real>
   JGX_HD void calc_NjTj(const double time, const std::size_t ie,
                         const double s, const double t, const double phi,
-                        double& ne, double& Te) const {
-    constexpr int n_v = 2;
-    const std::size_t pe[1] = { static_cast<std::size_t>(n_v) };
-
-    /* var_rho and var_T of mod_model_settings.f90, 0-based across the seam --
-     * the same hard-coded correspondence calc_EBpsiU_reduced makes for
-     * var_psi and var_u.  Both indices are with_TiTe = .false. values; with
-     * with_TiTe on, var_T is 0 and the temperature lives in var_Te instead,
-     * which is the second reason this branch is the only one covered. */
-    const std::int32_t iv_[n_v] = { 4, 5 };
-    const jgx::view<const std::int32_t, 1> i_v(iv_, pe);
-
-    Real P_[n_v], P_s_[n_v], P_t_[n_v], P_phi_[n_v], P_time_[n_v];
-    const jgx::view<Real, 1> P(P_, pe), P_s(P_s_, pe), P_t(P_t_, pe);
-    const jgx::view<Real, 1> P_phi(P_phi_, pe), P_time(P_time_, pe);
-
-    double R, R_s, R_t, Z, Z_s, Z_t;
-    interp.interp_PRZ(element_list, node_list, time, ie, i_v, n_v,
-                      s, t, phi, P, P_s, P_t, P_phi, P_time,
-                      R, R_s, R_t, Z, Z_s, Z_t);
-    (void)R; (void)R_s; (void)R_t; (void)Z; (void)Z_s; (void)Z_t;
-    (void)P_s; (void)P_t; (void)P_phi; (void)P_time;  /* values only */
+                        const ccoll::ccoll_table<Real>& dat,
+                        const coronal::coronal_table<Real>& cor,
+                        double& ne, double& Te,
+                        double ni[], double& Ti) const {
 
     const double n_ref = phys().central_density;
-    Te = fmax(P(1)/(2.0*K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
-    ne = fmax(n_ref*P(0)*1.0e20, 1.0e16);
+
+    if (dat.var_Ti >= 0) {
+       if (dat.n_ions > 1) {
+        // TiTe=T, Imp=T: [var_rho, var_Te, var_rhoimp, var_Ti]
+        constexpr int n_v = 4;
+        const std::size_t pe[1] = { static_cast<std::size_t>(n_v) };
+        const std::int32_t iv_[n_v] = {
+            static_cast<std::int32_t>(dat.var_rho),
+            static_cast<std::int32_t>(dat.var_Te),
+            static_cast<std::int32_t>(dat.var_rhoimp),
+            static_cast<std::int32_t>(dat.var_Ti)
+        };
+        const jgx::view<const std::int32_t, 1> i_v(iv_, pe);
+
+        Real P_[n_v], P_s_[n_v], P_t_[n_v], P_phi_[n_v], P_time_[n_v];
+        const jgx::view<Real, 1> P(P_, pe), P_s(P_s_, pe), P_t(P_t_, pe);
+        const jgx::view<Real, 1> P_phi(P_phi_, pe), P_time(P_time_, pe);
+
+        double R, R_s, R_t, Z, Z_s, Z_t;
+        interp.interp_PRZ(element_list, node_list, time, ie, i_v, n_v,
+                          s, t, phi, P, P_s, P_t, P_phi, P_time,
+                          R, R_s, R_t, Z, Z_s, Z_t);
+        (void)R; (void)R_s; (void)R_t; (void)Z; (void)Z_s; (void)Z_t;
+        (void)P_s; (void)P_t; (void)P_phi; (void)P_time;
+
+        // No factor of 2 -- mirrors Fortran with_TiTe=.true.:
+        // P(0)=var_rho, P(1)=var_Te, P(2)=var_rhoimp, P(3)=var_Ti
+        Te    = fmax(P(1)/(K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        Ti    = fmax(P(3)/(K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        ni[0] = fmax(n_ref*(P(0) - P(2))*1.0e20, 1.0e10);
+        ne    = ni[0];
+
+        double p_imp[coronal::MAX_CHARGE_STATES + 1] = {};
+        coronal::interp_coronal_p(cor, 20.0, log10(Te), p_imp);
+        for (int i = 1; i < dat.n_ions; ++i) {
+          ni[i] = n_ref*1.0e20 * dat.m_i_over_m_imp * p_imp[i-1] * P(2);
+          ne   += ni[i] * static_cast<double>(i - 1);
+        }
+      } else {
+        // TiTe=T, Imp=F: [var_rho, var_Te, var_Ti]
+        constexpr int n_v = 3;
+        const std::size_t pe[1] = { static_cast<std::size_t>(n_v) };
+        const std::int32_t iv_[n_v] = {
+            static_cast<std::int32_t>(dat.var_rho),
+            static_cast<std::int32_t>(dat.var_Te),
+            static_cast<std::int32_t>(dat.var_Ti)
+        };
+        const jgx::view<const std::int32_t, 1> i_v(iv_, pe);
+
+        Real P_[n_v], P_s_[n_v], P_t_[n_v], P_phi_[n_v], P_time_[n_v];
+        const jgx::view<Real, 1> P(P_, pe), P_s(P_s_, pe), P_t(P_t_, pe);
+        const jgx::view<Real, 1> P_phi(P_phi_, pe), P_time(P_time_, pe);
+
+        double R, R_s, R_t, Z, Z_s, Z_t;
+        interp.interp_PRZ(element_list, node_list, time, ie, i_v, n_v,
+                          s, t, phi, P, P_s, P_t, P_phi, P_time,
+                          R, R_s, R_t, Z, Z_s, Z_t);
+        (void)R; (void)R_s; (void)R_t; (void)Z; (void)Z_s; (void)Z_t;
+        (void)P_s; (void)P_t; (void)P_phi; (void)P_time;
+
+        // P(0)=var_rho, P(1)=var_Te, P(2)=var_Ti
+        Te    = fmax(P(1)/(K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        Ti    = fmax(P(2)/(K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        ne    = fmax(n_ref*P(0)*1.0e20, 1.0e16);
+        ni[0] = ne;
+      }
+    } else {
+      if (dat.n_ions > 1) {
+        // TiTe=F, Imp=T: [var_rho, var_T, var_rhoimp]
+        constexpr int n_v = 3;
+        const std::size_t pe[1] = { static_cast<std::size_t>(n_v) };
+        const std::int32_t iv_[n_v] = {
+            static_cast<std::int32_t>(dat.var_rho),
+            static_cast<std::int32_t>(dat.var_T),
+            static_cast<std::int32_t>(dat.var_rhoimp)
+        };
+        const jgx::view<const std::int32_t, 1> i_v(iv_, pe);
+
+        Real P_[n_v], P_s_[n_v], P_t_[n_v], P_phi_[n_v], P_time_[n_v];
+        const jgx::view<Real, 1> P(P_, pe), P_s(P_s_, pe), P_t(P_t_, pe);
+        const jgx::view<Real, 1> P_phi(P_phi_, pe), P_time(P_time_, pe);
+
+        double R, R_s, R_t, Z, Z_s, Z_t;
+        interp.interp_PRZ(element_list, node_list, time, ie, i_v, n_v,
+                          s, t, phi, P, P_s, P_t, P_phi, P_time,
+                          R, R_s, R_t, Z, Z_s, Z_t);
+        (void)R; (void)R_s; (void)R_t; (void)Z; (void)Z_s; (void)Z_t;
+        (void)P_s; (void)P_t; (void)P_phi; (void)P_time;
+
+        // P(0)=var_rho, P(1)=var_T, P(2)=var_rhoimp
+        Te    = fmax(P(1)/(2.0*K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        Ti    = Te;
+        ni[0] = fmax(n_ref*(P(0) - P(2))*1.0e20, 1.0e10);
+        ne    = ni[0];
+
+        double p_imp[coronal::MAX_CHARGE_STATES + 1] = {};
+        coronal::interp_coronal_p(cor, 20.0, log10(Te), p_imp);
+        for (int i = 1; i < dat.n_ions; ++i) {
+          ni[i] = n_ref*1.0e20 * dat.m_i_over_m_imp * p_imp[i-1] * P(2);
+          ne   += ni[i] * static_cast<double>(i - 1);
+        }
+
+      } else {
+        // TiTe=F, Imp=F: [var_rho, var_T]
+        constexpr int n_v = 2;
+        const std::size_t pe[1] = { static_cast<std::size_t>(n_v) };
+        const std::int32_t iv_[n_v] = {
+            static_cast<std::int32_t>(dat.var_rho),
+            static_cast<std::int32_t>(dat.var_T)
+        };
+        const jgx::view<const std::int32_t, 1> i_v(iv_, pe);
+
+        Real P_[n_v], P_s_[n_v], P_t_[n_v], P_phi_[n_v], P_time_[n_v];
+        const jgx::view<Real, 1> P(P_, pe), P_s(P_s_, pe), P_t(P_t_, pe);
+        const jgx::view<Real, 1> P_phi(P_phi_, pe), P_time(P_time_, pe);
+
+        double R, R_s, R_t, Z, Z_s, Z_t;
+        interp.interp_PRZ(element_list, node_list, time, ie, i_v, n_v,
+                          s, t, phi, P, P_s, P_t, P_phi, P_time,
+                          R, R_s, R_t, Z, Z_s, Z_t);
+        (void)R; (void)R_s; (void)R_t; (void)Z; (void)Z_s; (void)Z_t;
+        (void)P_s; (void)P_t; (void)P_phi; (void)P_time;
+
+        // P(0)=var_rho, P(1)=var_T
+        Te    = fmax(P(1)/(2.0*K_BOLTZ*MU_ZERO*n_ref*1.0e20), 1.0);
+        Ti    = Te;
+        ne    = fmax(n_ref*P(0)*1.0e20, 1.0e16);
+        ni[0] = ne;
+      } // dat.n_ions > 1
+    } // dat.var_Ti >= 0
+
   } // calc_NjTj
 };
 

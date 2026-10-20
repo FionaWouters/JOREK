@@ -49,7 +49,7 @@ module mod_ccoll_relativistic
        ccoll_init, ccoll_deallocate, ccoll_kinetic_relativistic_push, ccoll_gc_relativistic_push, &
        ccoll_kinetic_relativistic_explicitpush, ccoll_gc_relativistic_explicitpush, &
        ccoll_explicitpush_partialscreening, ccoll_gc_relativistic_push_partialscreening, &
-       ccoll_kinetic_relativistic_push_partialscreening
+       ccoll_kinetic_relativistic_push_partialscreening, interp_L0L1
 
 contains
 
@@ -290,13 +290,11 @@ contains
        dat%mi(2:nions) = ATOMIC_MASS_UNIT * central_mass / dat%m_i_over_m_imp
 
     else
-       allocate( dat%Z0(1), dat%Zi(1), dat%mi(1) )
+       allocate( dat%Z0(1), dat%Zi(1), dat%mi(1), dat%Ii(1), dat%ai(1) )
        dat%m_i_over_m_imp = 1
 
     end if
 
-
-    allocate( dat%Ii(1), dat%ai(1) )
     dat%mi(1) = central_mass * ATOMIC_MASS_UNIT
     dat%Zi(1) = 1
     dat%Z0(1) = 1
@@ -489,7 +487,7 @@ contains
     uhat = uin / u
 
     allocate(clogai(size(dat%mi)))
-    call ccoll_clog(ma,qa*EL_CHG,dat%mi,dat%Z0*EL_CHG,ne,the,ni,thi,u,clogae,clogai)
+    call ccoll_clog(ma,-qa*EL_CHG,dat%mi,dat%Z0*EL_CHG,ne,the,ni,thi,u,clogae,clogai)
 
     ! Electron contribution
     call ccoll_coeffs(dat,ma,qa*EL_CHG,clogae,MASS_ELECTRON,-EL_CHG,ne,the,u,K=Kb,Dpar=Dparb,Dperp=Dperpb)
@@ -585,7 +583,7 @@ contains
     ierr = 0
 
     allocate(clogai(size(dat%mi)))
-    call ccoll_clog(ma,qa*EL_CHG,dat%mi,dat%Z0*EL_CHG,ne,the,ni,thi,uin,clogae,clogai)
+    call ccoll_clog(ma,-qa*EL_CHG,dat%mi,dat%Z0*EL_CHG,ne,the,ni,thi,uin,clogae,clogai)
 
     ! Electron contribution
     call ccoll_coeffs(dat, ma, qa*EL_CHG, clogae, MASS_ELECTRON, -EL_CHG, ne, the, uin, &

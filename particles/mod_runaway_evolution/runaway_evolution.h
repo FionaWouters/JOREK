@@ -85,6 +85,7 @@ struct re_projection_indices {
 template <class Real = double>
 struct re_options {
     ccoll::ccoll_table<Real> ccoll;   /*< the L0/L1 table and the background ions */
+    coronal::coronal_table<Real> cor; /*< coronal equilibrium table needed if with_impurites=.t.*/
     bool use_ccoll    = false;        /*< collide after each push */
     bool use_radreact = false;        /*< radiation-reaction force inside the push */
 };
@@ -314,7 +315,7 @@ JGX_HD inline void evolve_RE(PS& part, const std::size_t ip, const FS& fields,
          * mesh: the collision operator interpolates the background at (i_elm,
          * s, t), which a lost particle no longer has. */
         if (opt.use_ccoll && part.i_elm(ip) > 0)
-            ccoll::ccoll_kinetic_relativistic_push(opt.ccoll, part, ip, fields,
+            ccoll::ccoll_kinetic_relativistic_push(opt.ccoll, opt.cor, part, ip, fields,
                                                    mass, time, timestep, rng);
 
         if (step_diag.not_found != 0 && diag.not_found == 0) {

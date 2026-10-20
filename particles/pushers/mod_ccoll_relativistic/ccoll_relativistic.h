@@ -41,6 +41,7 @@
 #include "tools/mod_pcg32/pcg32.h"
 #include "jgx/macros.h"
 #include "jgx/view.h"
+#include "particles/pushers/mod_ccoll_relativistic/coronal.h"
 
 namespace ccoll {
 
@@ -59,14 +60,27 @@ namespace ccoll {
  * off; it is passed rather than re-derived from phys() so that the Fortran
  * initialisation stays the single source of it.
  */
+static constexpr int MAX_ION_SPECIES=20; /*< ccoll can only use Ar(19) or Ne(11) not both */
 template <class Real = double>
 struct ccoll_table {
   jgx::view<const Real, 1> u;      /*< p/mc abscissa, ascending, log-equidistant */
   jgx::view<const Real, 1> theta;  /*< T/mc^2 abscissa, ascending, log-equidistant */
   jgx::view<const Real, 2> L0;     /*< (nu, nth) */
   jgx::view<const Real, 2> L1;     /*< (nu, nth) */
-  Real mi = 0;                     /*< main ion mass [kg] */
-  Real Z0 = 0;                     /*< main ion charge number [1] */
+
+  //static constexpr int MAX_ION_SPECIES = coronal::MAX_CHARGE_STATES + 1;
+  int n_ions = 1;
+  Real mi[MAX_ION_SPECIES] = {};                     /*< main ion mass [kg] */
+  Real Z0[MAX_ION_SPECIES] = {};                     /*< main ion charge number [1] */
+  Real m_i_over_m_imp = 1.0;
+
+  // NEW: variable indices, 0-based, passed from Fortran.
+  // -1 means the variable is not active in this build.
+  int var_rho    = 4;   // always active
+  int var_T      = 5;   // active when use_TiTe=false, else -1
+  int var_Ti     = -1;  // active when use_TiTe=true,  else -1
+  int var_Te     = -1;  // active when use_TiTe=true,  else -1
+  int var_rhoimp = -1;  // active when with_impurities=true, else -1
 
   JGX_HD int nu()  const { return static_cast<int>(u.extent[0]); }
   JGX_HD int nth() const { return static_cast<int>(theta.extent[0]); }
@@ -86,7 +100,14 @@ JGX_HD inline ccoll_table<Real>
 make_ccoll_table(const int nu, const int nth,
                  const Real* u, const Real* theta,
                  const Real* L0, const Real* L1,
-                 const Real mi, const Real Z0) {
+                 const int n_ions,
+                 const Real* mi, const Real* Z0, 
+                 const Real m_i_over_m_imp, 
+                 const int   var_rho,
+                 const int   var_T,
+                 const int   var_Ti,
+                 const int   var_Te,
+                 const int   var_rhoimp) {
   const std::size_t ue[1] = { static_cast<std::size_t>(nu) };
   const std::size_t te[1] = { static_cast<std::size_t>(nth) };
   const std::size_t fe[2] = { static_cast<std::size_t>(nu),
@@ -96,8 +117,17 @@ make_ccoll_table(const int nu, const int nth,
   d.theta = jgx::view<const Real, 1>(theta, te);
   d.L0    = jgx::view<const Real, 2>(L0, fe);
   d.L1    = jgx::view<const Real, 2>(L1, fe);
-  d.mi    = mi;
-  d.Z0    = Z0;
+  d.n_ions         = n_ions;
+  d.m_i_over_m_imp = m_i_over_m_imp;
+  d.var_rho        = var_rho;
+  d.var_T          = var_T;
+  d.var_Ti         = var_Ti;
+  d.var_Te         = var_Te;
+  d.var_rhoimp     = var_rhoimp;
+  for (int i = 0; i < n_ions; ++i) {
+      d.mi[i] = mi[i];
+      d.Z0[i] = Z0[i];
+  }
   return d;
 } // make_ccoll_table
 
@@ -177,11 +207,13 @@ JGX_HD inline void ccoll_mufuncs(const ccoll_table<Real>& dat, const double u,
  * @param u         normalised test particle momentum [p/mc]
  * @param[out] cloge, clogi
  */
+//template<class Real, int N>
 JGX_HD inline void ccoll_clog(const double ma, const double qa_C,
-                              const double mi, const double qi_C,
+                              const double mi[], const double qi_C[],
+                              const int n_ions,
                               const double ne, const double the,
-                              const double ni, const double thi, const double u,
-                              double& cloge, double& clogi) {
+                              const double ni[], const double thi[], const double u,
+                              double& cloge, double clogi[]) {
   const double c2 = jorek::SPEED_OF_LIGHT*jorek::SPEED_OF_LIGHT;
   const double debyeLength = std::sqrt(jorek::EPS_ZERO*c2
       / ((ne*jorek::EL_CHG*jorek::EL_CHG)/(the*jorek::MASS_ELECTRON)));
@@ -192,16 +224,21 @@ JGX_HD inline void ccoll_clog(const double ma, const double qa_C,
   double bqm  = jorek::HBAR/(2.0*mr*ubar);
   cloge = log(debyeLength/fmax(bcl, bqm));
 
-  ubar = jorek::SPEED_OF_LIGHT*std::sqrt(u*u/(1.0 + u*u) + 3.0*thi);
-  mr   = ma*mi/(ma + mi);
-  bcl  = qa_C*qi_C/(4.0*jorek::PI*jorek::EPS_ZERO*mr*ubar*ubar);
-  bqm  = jorek::HBAR/(2.0*mr*ubar);
-  clogi = log(debyeLength/fmax(bcl, bqm));
+  for (int i = 0; i < n_ions; ++i) {
+    //double qi_C = Z0[i] * jorek::EL_CHG;
+    double ubar = jorek::SPEED_OF_LIGHT*std::sqrt(u*u/(1.0+u*u) + 3.0*thi[i]);
+    double mr   = ma*mi[i]/(ma + mi[i]);
+    double bcl  = qa_C*qi_C[i]/(4.0*jorek::PI*jorek::EPS_ZERO*mr*ubar*ubar);
+    double bqm  = jorek::HBAR/(2.0*mr*ubar);
+    clogi[i] = log(debyeLength/fmax(bcl, bqm));
+  }
 } // ccoll_clog
 
 /**
  * mod_ccoll_relativistic::ccoll_coeffs -- the Fokker-Planck coefficients
  * against one background species.
+ * 
+ * The calculation of the derivatives is not in the C++ version
  *
  * @param dat       the table
  * @param ma, qa_C  test particle mass [kg] and charge [C]
@@ -257,7 +294,7 @@ JGX_HD inline void ccoll_coeffs(const ccoll_table<Real>& dat,
 template<class Real>
 JGX_HD inline void ccoll_kinetic_relativistic_explicitpush(
     const ccoll_table<Real>& dat, const double ma, const int qa,
-    const double ne, const double the, const double ni, const double thi,
+    const double ne, const double the, const double ni[], const double thi[],
     const double dt, const double rnd[3], const double uin[3], double uout[3]) {
 
   // Wiener process for this step
@@ -269,10 +306,15 @@ JGX_HD inline void ccoll_kinetic_relativistic_explicitpush(
   const double uhat[3] = { uin[0]/u, uin[1]/u, uin[2]/u };
 
   const double qa_C = static_cast<double>(qa)*jorek::EL_CHG;
-  const double qi_C = dat.Z0*jorek::EL_CHG;
+  // const double qi_C = dat.Z0*jorek::EL_CHG;
+  double qi_C[ccoll::MAX_ION_SPECIES];
+  for (int i = 0; i < dat.n_ions; ++i) {
+    qi_C[i] = dat.Z0[i] * jorek::EL_CHG;
+  }
 
-  double cloge, clogi;
-  ccoll_clog(ma, qa_C, dat.mi, qi_C, ne, the, ni, thi, u, cloge, clogi);
+  double cloge;
+  double clogi[ccoll::MAX_ION_SPECIES];
+  ccoll_clog(ma, -qa_C, dat.mi, qi_C, dat.n_ions, ne, the, ni, thi, u, cloge, clogi);
 
   // Electron contribution
   double K, Dpar, Dperp;
@@ -280,12 +322,15 @@ JGX_HD inline void ccoll_kinetic_relativistic_explicitpush(
                ne, the, u, K, Dpar, Dperp);
 
   // Ion contribution
-  double Kb, Dparb, Dperpb;
-  ccoll_coeffs(dat, ma, qa_C, clogi, dat.mi, qi_C, ni, thi, u,
-               Kb, Dparb, Dperpb);
-  K     += Kb;
-  Dpar  += Dparb;
-  Dperp += Dperpb;
+  for (int i = 0; i < dat.n_ions; ++i) {
+    double Kb, Dparb, Dperpb;
+    ccoll_coeffs(dat, ma, qa_C, clogi[i],
+                dat.mi[i], dat.Z0[i]*jorek::EL_CHG,
+                ni[i], thi[i], u, Kb, Dparb, Dperpb);
+    K     += Kb;
+    Dpar  += Dparb;
+    Dperp += Dperpb;
+  }
 
   // Use Euler-Maruyama method to get uout
   const double udotW = uhat[0]*dW[0] + uhat[1]*dW[1] + uhat[2]*dW[2];
@@ -323,6 +368,7 @@ JGX_HD inline void ccoll_kinetic_relativistic_explicitpush(
  */
 template<class Real, class PS, class FS>
 JGX_HD inline void ccoll_kinetic_relativistic_push(const ccoll_table<Real>& dat,
+                                                   const coronal::coronal_table<Real>& cor,
                                                    PS& part, const std::size_t ip,
                                                    const FS& fields,
                                                    const double mass,
@@ -332,13 +378,18 @@ JGX_HD inline void ccoll_kinetic_relativistic_push(const ccoll_table<Real>& dat,
   const double c2 = jorek::SPEED_OF_LIGHT*jorek::SPEED_OF_LIGHT;
 
   double ne, Te;
+  double ni[ccoll::MAX_ION_SPECIES], Ti;
   fields.calc_NjTj(time, static_cast<std::size_t>(part.i_elm(ip)) - 1,
-                   part.st(ip, 0), part.st(ip, 1), part.x(ip, 2), ne, Te);
+                   part.st(ip, 0), part.st(ip, 1), part.x(ip, 2), 
+                   dat, cor,
+                   ne, Te, ni, Ti);
 
   /* Single ion species and quasineutral, which is what calc_NjTj leaves when
    * with_impurities is off: ni = ne. Ti = Te comes from with_TiTe being off. */
   const double the = Te*jorek::K_BOLTZ/(jorek::MASS_ELECTRON*c2);
-  const double thi = Te*jorek::K_BOLTZ/(dat.mi*c2);
+  double thi[ccoll::MAX_ION_SPECIES];
+  for (int i = 0; i < dat.n_ions; ++i)
+      thi[i] = Ti*jorek::K_BOLTZ/(dat.mi[i]*c2);
 
   double rnd[3];
   for (int k = 0; k < 3; ++k)
@@ -350,7 +401,7 @@ JGX_HD inline void ccoll_kinetic_relativistic_push(const ccoll_table<Real>& dat,
 
   ccoll_kinetic_relativistic_explicitpush(
       dat, mass*jorek::ATOMIC_MASS_UNIT, static_cast<int>(part.q(ip)),
-      ne, the, ne, thi, dt, rnd, uin, uout);
+      ne, the, ni, thi, dt, rnd, uin, uout);
 
   for (int k = 0; k < 3; ++k) part.p(ip, k) = uout[k]*mc;
 } // ccoll_kinetic_relativistic_push
