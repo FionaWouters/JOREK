@@ -142,7 +142,6 @@ extern "C" {
                                                 const double*  cor_density,
                                                 const double*  cor_temperature,
                                                 const double*  cor_Z,
-                                                const int32_t use_TiTe,
                                                 const int64_t rng_seed,
                                                 const int64_t rng_stream_base,
                                                 int32_t* not_found,
@@ -253,19 +252,6 @@ extern "C" {
         cor_args.density     = cor_density;
         cor_args.temperature = cor_temperature;
         cor_args.Z           = cor_Z;
-
-        fprintf(stderr, "SHIM: sizeof(jgx_re_cor_args)=%zu\n", sizeof(jgx_re_cor_args));
-        fprintf(stderr, "SHIM: &cor_args=%p\n", (void*)&cor_args);
-        fprintf(stderr, "SHIM: &cor_args.n_d=%p (offset %zu)\n",
-                (void*)&cor_args.n_d,
-                (std::size_t)((char*)&cor_args.n_d - (char*)&cor_args));
-        fprintf(stderr, "SHIM: &cor_args.density=%p (offset %zu)\n",
-                (void*)&cor_args.density,
-                (std::size_t)((char*)&cor_args.density - (char*)&cor_args));
-        fprintf(stderr, "SHIM: n_d=%d n_T=%d n_Z=%d\n",
-                cor_args.n_d, cor_args.n_T, cor_args.n_Z);
-        fprintf(stderr, "SHIM: density=%p temperature=%p Z=%p\n",
-                (void*)cor_args.density, (void*)cor_args.temperature, (void*)cor_args.Z);
 
         jgx_device_runaway_evolution_evolve_REs(
             part_base,

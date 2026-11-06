@@ -153,15 +153,10 @@ contains
     ! not ported at all. Guarded here rather than in the kernel, which cannot
     ! report anything.
     if (use_ccoll) then
-!#if defined(WITH_TiTe) || defined(WITH_Impurities)
-!      error stop "evolve_REs: use_ccoll needs with_TiTe = .f. and with_impurities = .f."
-!#endif
       if (.not. re_ccoll_ready) then
         call ccoll_init('ccolldata', re_ccoll_data)
         re_ccoll_ready = .true.
       end if
-!      if (size(re_ccoll_data%mi) /= 1) &
-!        error stop "evolve_REs: the C++ collision operator takes exactly one ion species"
     end if
 
     ! One seed for the whole run, drawn on rank 0 and broadcast, as every other
@@ -301,7 +296,6 @@ contains
         !$ call omp_set_schedule(omp_sched_dynamic,10)
       end if
 
-      write(*,*) 'just before entering C++ thingies'
       select type (fi => sim%fields%interp)
       type is (jorek_fields_interp_linear)
         call evolve_REs_kernel(                                                 &

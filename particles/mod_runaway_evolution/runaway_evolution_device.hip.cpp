@@ -510,15 +510,6 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
     int32_t* not_found, double* nf_R, double* nf_Z,
     int32_t* bad_i_from, int32_t* bad_i_to) {
 
-      // At the start of jgx_device_runaway_evolution_evolve_REs:
-      fprintf(stderr, "cor_args=%p\n", (void*)cor_args);
-      if (cor_args != nullptr) {
-          fprintf(stderr, "cor->n_d=%d cor->n_T=%d cor->n_Z=%d\n",
-                  cor_args->n_d, cor_args->n_T, cor_args->n_Z);
-          fprintf(stderr, "cor->density=%p cor->temperature=%p cor->Z=%p\n",
-                  (void*)cor_args->density, (void*)cor_args->temperature, (void*)cor_args->Z);
-      }
-
   if (n_particles == 0 || n_elements == 0) return;
 
   /* Fortran logicals: `.true.` is -1, so both are tested against zero. */
@@ -621,12 +612,6 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
   const device_buffer tab_cor_temperature(safe_cor_nT       * sizeof(double));
   const device_buffer tab_cor_Z          (safe_cor_nZ_total * sizeof(double));
 
-  // Diagnostic -- remove after confirming correct:
-  fprintf(stderr, "[ccoll] cor_nd=%zu cor_nT=%zu cor_nZ=%zu cor_nZ_total=%zu\n",
-          cor_nd, cor_nT, cor_nZ, cor_nZ_total);
-  fprintf(stderr, "[ccoll] cor_args->density=%p cor_args->Z=%p\n",
-          (void*)cor_args->density, (void*)cor_args->Z);
-
   ccoll_table ccoll_dev;
   if (do_ccoll) {
     jgx_c_push(tab_u.get(),  ccoll_args->u,     tab_u.bytes());
@@ -665,9 +650,8 @@ extern "C" void jgx_device_runaway_evolution_evolve_REs(
           tab_cor_density.as<double>(),
           tab_cor_temperature.as<double>(),
           tab_cor_Z.as<double>());
-      fprintf(stderr, "[ccoll] coronal table built successfully\n");
   } else {
-      fprintf(stderr, "[ccoll] coronal table not built (n_ions=%d cor_nd=%zu)\n",
+      fprintf(stderr, "WARNING: [ccoll] coronal table not built (n_ions=%d cor_nd=%zu)\n",
               do_ccoll ? ccoll_args->n_ions : 0, cor_nd);
   }
 
